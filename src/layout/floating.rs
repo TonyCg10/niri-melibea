@@ -407,7 +407,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.add_tile_at(0, tile, activate);
     }
 
-    fn add_tile_at(&mut self, mut idx: usize, mut tile: Tile<W>, activate: bool) {
+    pub(super) fn add_tile_at(&mut self, mut idx: usize, mut tile: Tile<W>, activate: bool) {
         tile.update_config(self.view_size, self.scale, self.options.clone());
 
         // Restore the previous floating window size, and in case the tile is fullscreen,
@@ -545,6 +545,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         &mut self,
         renderer: &mut GlesRenderer,
         id: &W::Id,
+        travel_to: Option<Rectangle<f64, Logical>>,
         blocker: TransactionBlocker,
     ) {
         let (tile, tile_pos) = self
@@ -558,7 +559,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let tile_size = tile.tile_size();
 
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.start_close_animation_for_tile(
+            renderer, snapshot, tile_size, tile_pos, travel_to, blocker,
+        );
     }
 
     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
@@ -597,6 +600,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
+        travel_to: Option<Rectangle<f64, Logical>>,
         blocker: TransactionBlocker,
     ) {
         let anim = Animation::new(
@@ -615,7 +619,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let scale = Scale::from(self.scale);
         let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
+            renderer, snapshot, scale, tile_size, tile_pos, travel_to, blocker, anim,
         );
         match res {
             Ok(closing) => {
@@ -679,12 +683,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.interactive_resize_end(Some(&id));
     }
 
-    pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
+    pub fn start_open_animation(
+        &mut self,
+        id: &W::Id,
+        travel_from: Option<Rectangle<f64, Logical>>,
+    ) -> bool {
         let Some(idx) = self.idx_of(id) else {
             return false;
         };
 
-        self.tiles[idx].start_open_animation();
+        self.tiles[idx].start_open_animation_from(travel_from);
         true
     }
 

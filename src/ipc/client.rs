@@ -7,8 +7,9 @@ use anyhow::{anyhow, bail, Context};
 use niri_config::OutputName;
 use niri_ipc::socket::Socket;
 use niri_ipc::{
-    Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
-    OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
+    Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, MinimizedWindow,
+    Mode, Output, OutputConfigChanged, Overview, Request, Response, Transform, Window,
+    WindowActionStatus, WindowLayout,
 };
 use serde_json::json;
 
@@ -43,6 +44,7 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         },
         Msg::Workspaces => Request::Workspaces,
         Msg::Windows => Request::Windows,
+        Msg::MinimizedWindows => Request::MinimizedWindows,
         Msg::Layers => Request::Layers,
         Msg::KeyboardLayouts => Request::KeyboardLayouts,
         Msg::EventStream => Request::EventStream,
@@ -200,6 +202,29 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                 println!();
             }
         }
+        Msg::MinimizedWindows => {
+            let Response::MinimizedWindows(mut windows) = response else {
+                bail!("unexpected response: expected MinimizedWindows, got {response:?}");
+            };
+
+            if json {
+                let windows =
+                    serde_json::to_string(&windows).context("error formatting response")?;
+                println!("{windows}");
+                return Ok(());
+            }
+
+            if windows.is_empty() {
+                println!("No minimized windows.");
+                return Ok(());
+            }
+
+            windows.sort_unstable_by_key(|window| window.id);
+            for window in windows {
+                print_minimized_window(&window);
+                println!();
+            }
+        }
         Msg::Layers => {
             let Response::Layers(mut layers) = response else {
                 bail!("unexpected response: expected Layers, got {response:?}");
@@ -317,11 +342,31 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                 println!("No color was picked.");
             }
         }
-        Msg::Action { .. } => {
-            let Response::Handled = response else {
-                bail!("unexpected response: expected Handled, got {response:?}");
-            };
-        }
+        Msg::Action { .. } => match response {
+            Response::Handled => (),
+            Response::WindowActionResult(result) => {
+                if json {
+                    let result = serde_json::to_string(&result)
+                        .context("error formatting window action result")?;
+                    println!("{result}");
+                } else {
+                    match result.status {
+                        WindowActionStatus::Applied
+                        | WindowActionStatus::AlreadyInRequestedState
+                        | WindowActionStatus::CloseRequested => (),
+                        WindowActionStatus::WindowNotFound => {
+                            bail!("window action target was not found")
+                        }
+                        WindowActionStatus::Blocked => {
+                            bail!("window action was blocked by current compositor state")
+                        }
+                    }
+                }
+            }
+            response => bail!(
+                "unexpected response: expected Handled or WindowActionResult, got {response:?}"
+            ),
+        },
         Msg::Output { output, .. } => {
             let Response::OutputConfigChanged(response) = response else {
                 bail!("unexpected response: expected OutputConfigChanged, got {response:?}");
@@ -449,6 +494,9 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                     }
                     Event::WindowsChanged { windows } => {
                         println!("Windows changed: {windows:?}");
+                    }
+                    Event::MinimizedWindowsChanged { windows } => {
+                        println!("Minimized windows changed: {windows:?}");
                     }
                     Event::WindowOpenedOrChanged { window } => {
                         println!("Window opened or changed: {window:?}");
@@ -736,6 +784,29 @@ fn print_window(window: &Window) {
         fmt_rounded(window_offset_in_tile.0),
         fmt_rounded(window_offset_in_tile.1)
     );
+}
+
+fn print_minimized_window(window: &MinimizedWindow) {
+    let urgent = if window.is_urgent { " (urgent)" } else { "" };
+    println!("Minimized window ID {}:{urgent}", window.id);
+
+    if let Some(title) = &window.title {
+        println!("  Title: \"{title}\"");
+    } else {
+        println!("  Title: (unset)");
+    }
+
+    if let Some(app_id) = &window.app_id {
+        println!("  App ID: \"{app_id}\"");
+    } else {
+        println!("  App ID: (unset)");
+    }
+
+    if let Some(pid) = window.pid {
+        println!("  PID: {pid}");
+    } else {
+        println!("  PID: (unknown)");
+    }
 }
 
 fn print_cast(cast: &Cast) {

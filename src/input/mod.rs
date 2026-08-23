@@ -9,7 +9,7 @@ use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
     Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
 };
-use niri_ipc::LayoutSwitchTarget;
+use niri_ipc::{LayoutSwitchTarget, WindowTransition};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
@@ -19,6 +19,7 @@ use smithay::backend::input::{
     TabletToolTipState, TouchEvent,
 };
 use smithay::backend::libinput::LibinputInputBackend;
+use smithay::desktop::Window;
 use smithay::input::dnd::DnDGrab;
 use smithay::input::keyboard::{keysyms, FilterResult, Keysym, Layout, ModifiersState};
 use smithay::input::pointer::{
@@ -53,6 +54,7 @@ use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
+use crate::utils::transaction::TransactionBlocker;
 use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
@@ -113,6 +115,155 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
 }
 
 impl State {
+    /// Resolves a minimize target and applies it with an optional presentation hint.
+    ///
+    /// `id` selects a window explicitly; `None` uses the focused window. The transition only ever
+    /// affects presentation, so a missing or unusable hint changes nothing about the outcome.
+    fn act_minimize(&mut self, id: Option<u64>, transition: Option<&WindowTransition>) {
+        let window = match id {
+            None => self.niri.layout.focus().map(|mapped| mapped.window.clone()),
+            Some(id) => self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id().get() == id)
+                .map(|(_, mapped)| mapped.window.clone()),
+        };
+        let Some(window) = window else {
+            return;
+        };
+
+        if !self.minimize_window_with_animation(&window, transition) {
+            return;
+        }
+
+        let ids = self
+            .niri
+            .layout
+            .minimized_group_windows(&window)
+            .map(|mapped| mapped.id().get())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.niri.stop_casts_for_target(CastTarget::Window { id });
+        }
+        self.maybe_warp_cursor_to_focus();
+        self.niri.layer_shell_on_demand_focus = None;
+        self.niri.queue_redraw_all();
+    }
+
+    /// Restores one minimized window with an optional presentation hint.
+    fn act_restore(&mut self, id: u64, transition: Option<&WindowTransition>) {
+        let window = self
+            .niri
+            .layout
+            .minimized_windows()
+            .find(|mapped| mapped.id().get() == id)
+            .map(|mapped| mapped.window.clone());
+        let Some(window) = window else {
+            return;
+        };
+
+        if self.restore_window_with_animation(&window, transition) {
+            self.maybe_warp_cursor_to_focus();
+            self.niri.layer_shell_on_demand_focus = None;
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    /// Starts compositor-local disappearance snapshots, then performs the
+    /// authoritative minimize transition immediately.
+    ///
+    /// The animation travels toward a shell-supplied anchor when one resolves, and otherwise
+    /// reuses niri's existing close visual. Neither form delays or owns the minimized lifecycle
+    /// state, and `disabled` skips the visual entirely.
+    fn minimize_window_with_animation(
+        &mut self,
+        window: &Window,
+        transition: Option<&WindowTransition>,
+    ) -> bool {
+        let family = self.niri.layout.minimization_family(window);
+        if family.is_empty() {
+            return false;
+        }
+
+        // Resolve before anything is removed from the layout: resolution reads the window's
+        // current output and workspace, which stop existing once the tiles are held.
+        let resolved = self
+            .niri
+            .layout
+            .resolve_window_transition(window, transition);
+
+        if !resolved.is_disabled() {
+            let family = family
+                .into_iter()
+                .map(|window| {
+                    let output = self
+                        .niri
+                        .layout
+                        .windows()
+                        .find(|(_, mapped)| mapped.window == window)
+                        .and_then(|(monitor, _)| monitor.map(|monitor| monitor.output().clone()));
+                    (window, output)
+                })
+                .collect::<Vec<_>>();
+
+            for (window, output) in &family {
+                self.store_unmap_snapshot(window, output.as_ref());
+            }
+            let travel_to = resolved.anchor();
+            self.backend.with_primary_renderer(|renderer| {
+                for (window, _) in &family {
+                    self.niri.layout.start_close_animation_for_window(
+                        renderer,
+                        window,
+                        travel_to,
+                        TransactionBlocker::completed(),
+                    );
+                }
+            });
+        }
+
+        let minimized = self.niri.layout.minimize_window(window);
+        debug_assert!(minimized, "eligible minimization changed synchronously");
+        minimized
+    }
+
+    /// Restores authoritative state first, then starts compositor-local
+    /// appearance animations for every member of the restored family.
+    ///
+    /// State is reestablished before any visual begins, so an anchored trajectory can be resolved
+    /// against the window's real restored output and workspace rather than a guess.
+    fn restore_window_with_animation(
+        &mut self,
+        window: &Window,
+        transition: Option<&WindowTransition>,
+    ) -> bool {
+        let family = self
+            .niri
+            .layout
+            .minimized_group_windows(window)
+            .map(|mapped| mapped.window.clone())
+            .collect::<Vec<_>>();
+        if family.is_empty() || !self.niri.layout.restore_window(window) {
+            return false;
+        }
+
+        let resolved = self
+            .niri
+            .layout
+            .resolve_window_transition(window, transition);
+        if resolved.is_disabled() {
+            return true;
+        }
+
+        for window in family {
+            self.niri
+                .layout
+                .start_open_animation_for_window_from(&window, resolved.anchor());
+        }
+        true
+    }
+
     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
     where
         I::Device: 'static, // Needed for downcasting.
@@ -804,10 +955,33 @@ impl State {
                 }
             }
             Action::CloseWindowById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                if let Some((_, mapped)) = window {
+                let minimized = self
+                    .niri
+                    .layout
+                    .minimized_windows()
+                    .find(|mapped| mapped.id().get() == id)
+                    .map(|mapped| mapped.window.clone());
+                if let Some(window) = minimized {
+                    for mapped in self.niri.layout.minimized_group_windows(&window) {
+                        mapped.toplevel().send_close();
+                    }
+                } else if let Some((_, mapped)) = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find(|(_, mapped)| mapped.id().get() == id)
+                {
                     mapped.toplevel().send_close();
                 }
+            }
+            Action::MinimizeWindow => self.act_minimize(None, None),
+            Action::MinimizeWindowById(id) => self.act_minimize(Some(id), None),
+            Action::MinimizeWindowWithTransition(id, transition) => {
+                self.act_minimize(id, Some(&transition));
+            }
+            Action::RestoreWindow(id) => self.act_restore(id, None),
+            Action::RestoreWindowWithTransition(id, transition) => {
+                self.act_restore(id, Some(&transition));
             }
             Action::FullscreenWindow => {
                 let focus = self.niri.layout.focus().map(|m| m.window.clone());

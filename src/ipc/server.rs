@@ -18,7 +18,7 @@ use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
     Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Timestamp, WindowActionResult, WindowActionStatus, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -287,6 +287,10 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let windows = state.windows.windows.values().cloned().collect();
             Response::Windows(windows)
         }
+        Request::MinimizedWindows => {
+            let state = ctx.event_stream_state.borrow();
+            Response::MinimizedWindows(state.minimized_windows.windows.clone())
+        }
         Request::Layers => {
             let (tx, rx) = async_channel::bounded(1);
             ctx.event_loop.insert_idle(move |state| {
@@ -383,20 +387,25 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 
             let (tx, rx) = async_channel::bounded(1);
 
-            let action = niri_config::Action::from(action);
+            let ipc_action = action;
+            let action = niri_config::Action::from(ipc_action.clone());
             ctx.event_loop.insert_idle(move |state| {
                 // Make sure some logic like workspace clean-up has a chance to run before doing
                 // actions.
                 state.niri.advance_animations();
+                let probe = WindowActionProbe::capture(state, &ipc_action);
                 state.do_action(action, false);
-                let _ = tx.send_blocking(());
+                let result = probe.map(|probe| probe.finish(state));
+                let _ = tx.send_blocking(result);
             });
 
             // Wait until the action has been processed before returning. This is important for a
             // few actions, for instance for DoScreenTransition this wait ensures that the screen
             // contents were sampled into the texture.
-            let _ = rx.recv().await;
-            Response::Handled
+            match rx.recv().await {
+                Ok(Some(result)) => Response::WindowActionResult(result),
+                Ok(None) | Err(_) => Response::Handled,
+            }
         }
         Request::Output { output, action } => {
             action.validate()?;
@@ -458,6 +467,186 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
     };
 
     Ok(response)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProbedWindowState {
+    Pending(u64),
+    Already(u64),
+    Missing,
+    Blocked(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WindowActionProbe {
+    Minimize {
+        requested_id: Option<u64>,
+        state: ProbedWindowState,
+    },
+    Restore {
+        requested_id: u64,
+        state: ProbedWindowState,
+    },
+    Close {
+        requested_id: u64,
+        state: ProbedWindowState,
+    },
+}
+
+impl WindowActionProbe {
+    fn capture(state: &State, action: &Action) -> Option<Self> {
+        let layout = &state.niri.layout;
+        match action {
+            Action::MinimizeWindow { id, .. } => {
+                let target_id = id.or_else(|| layout.focus().map(|mapped| mapped.id().get()));
+                let state = match target_id {
+                    Some(id) if visible_window_exists(state, id) => ProbedWindowState::Pending(id),
+                    Some(id) => minimized_family_root_id(state, id)
+                        .map(ProbedWindowState::Already)
+                        .unwrap_or(ProbedWindowState::Missing),
+                    None => ProbedWindowState::Missing,
+                };
+                Some(Self::Minimize {
+                    requested_id: *id,
+                    state,
+                })
+            }
+            Action::RestoreWindow { id, .. } => {
+                let state = if layout
+                    .minimized_windows()
+                    .any(|mapped| mapped.id().get() == *id)
+                {
+                    ProbedWindowState::Pending(*id)
+                } else if visible_window_exists(state, *id) {
+                    ProbedWindowState::Already(*id)
+                } else {
+                    ProbedWindowState::Missing
+                };
+                Some(Self::Restore {
+                    requested_id: *id,
+                    state,
+                })
+            }
+            Action::CloseWindow { id: Some(id) } => {
+                let exists = visible_window_exists(state, *id)
+                    || layout
+                        .minimized_windows()
+                        .any(|mapped| mapped.id().get() == *id);
+                let state = if state.niri.is_locked() && exists {
+                    ProbedWindowState::Blocked(*id)
+                } else if exists {
+                    ProbedWindowState::Pending(*id)
+                } else {
+                    ProbedWindowState::Missing
+                };
+                Some(Self::Close {
+                    requested_id: *id,
+                    state,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn finish(self, state: &State) -> WindowActionResult {
+        match self {
+            Self::Minimize {
+                requested_id,
+                state: ProbedWindowState::Pending(id),
+            } => {
+                if let Some(root_id) = minimized_family_root_id(state, id) {
+                    WindowActionResult {
+                        requested_id,
+                        window_id: Some(root_id),
+                        status: WindowActionStatus::Applied,
+                    }
+                } else {
+                    WindowActionResult {
+                        requested_id,
+                        window_id: Some(id),
+                        status: WindowActionStatus::Blocked,
+                    }
+                }
+            }
+            Self::Minimize {
+                requested_id,
+                state: ProbedWindowState::Already(id),
+            } => WindowActionResult {
+                requested_id,
+                window_id: Some(id),
+                status: WindowActionStatus::AlreadyInRequestedState,
+            },
+            Self::Minimize { requested_id, .. } => WindowActionResult {
+                requested_id,
+                window_id: None,
+                status: WindowActionStatus::WindowNotFound,
+            },
+            Self::Restore {
+                requested_id,
+                state: ProbedWindowState::Pending(id),
+            } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: Some(id),
+                status: if visible_window_exists(state, id) {
+                    WindowActionStatus::Applied
+                } else {
+                    WindowActionStatus::Blocked
+                },
+            },
+            Self::Restore {
+                requested_id,
+                state: ProbedWindowState::Already(id),
+            } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: Some(id),
+                status: WindowActionStatus::AlreadyInRequestedState,
+            },
+            Self::Restore { requested_id, .. } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: None,
+                status: WindowActionStatus::WindowNotFound,
+            },
+            Self::Close {
+                requested_id,
+                state: ProbedWindowState::Pending(id),
+            } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: Some(id),
+                status: WindowActionStatus::CloseRequested,
+            },
+            Self::Close {
+                requested_id,
+                state: ProbedWindowState::Blocked(id),
+            } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: Some(id),
+                status: WindowActionStatus::Blocked,
+            },
+            Self::Close { requested_id, .. } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: None,
+                status: WindowActionStatus::WindowNotFound,
+            },
+        }
+    }
+}
+
+fn visible_window_exists(state: &State, id: u64) -> bool {
+    state
+        .niri
+        .layout
+        .windows()
+        .any(|(_, mapped)| mapped.id().get() == id)
+}
+
+fn minimized_family_root_id(state: &State, id: u64) -> Option<u64> {
+    let layout = &state.niri.layout;
+    let mapped = layout
+        .minimized_windows_with_descendants()
+        .find(|mapped| mapped.id().get() == id)?;
+    layout
+        .minimized_group_leader(&mapped.window)
+        .map(|leader| leader.id().get())
 }
 
 fn validate_action(action: &Action) -> Result<(), String> {
@@ -531,6 +720,17 @@ fn make_ipc_window(
     })
 }
 
+fn make_ipc_minimized_window(mapped: &Mapped) -> niri_ipc::MinimizedWindow {
+    with_toplevel_role(mapped.toplevel(), |role| niri_ipc::MinimizedWindow {
+        id: mapped.id().get(),
+        title: role.title.clone(),
+        app_id: role.app_id.clone(),
+        pid: mapped.credentials().map(|c| c.pid),
+        is_urgent: mapped.is_urgent(),
+        focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
+    })
+}
+
 impl State {
     pub fn ipc_keyboard_layouts_changed(&mut self) {
         let keyboard = self.niri.seat.get_keyboard().unwrap();
@@ -583,6 +783,7 @@ impl State {
     pub fn ipc_refresh_layout(&mut self) {
         self.ipc_refresh_workspaces();
         self.ipc_refresh_windows();
+        self.ipc_refresh_minimized_windows();
         self.ipc_refresh_overview();
     }
 
@@ -786,6 +987,29 @@ impl State {
             state.apply(event.clone());
             server.send_event(event);
         }
+    }
+
+    fn ipc_refresh_minimized_windows(&mut self) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        let windows = self
+            .niri
+            .layout
+            .minimized_windows()
+            .map(make_ipc_minimized_window)
+            .collect::<Vec<_>>();
+
+        let mut state = server.event_stream_state.borrow_mut();
+        let state = &mut state.minimized_windows;
+        if state.windows == windows {
+            return;
+        }
+
+        let event = Event::MinimizedWindowsChanged { windows };
+        state.apply(event.clone());
+        server.send_event(event);
     }
 
     pub fn ipc_refresh_overview(&mut self) {

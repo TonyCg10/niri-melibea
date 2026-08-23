@@ -34,6 +34,7 @@ use crate::utils::transaction::Transaction;
 use crate::utils::{
     baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1,
 };
+use crate::window::ResolvedWindowRules;
 
 /// Toplevel window with decorations.
 #[derive(Debug)]
@@ -95,6 +96,19 @@ pub struct Tile<W: LayoutElement> {
 
     /// The animation of the tile's opacity.
     pub(super) alpha_animation: Option<AlphaAnimation>,
+
+    /// Carries the focus-dependent window rules from their old values to their new ones.
+    ///
+    /// Rules resolve instantly: the frame a window stops being focused, `opacity` and `shadow`
+    /// are simply the other rule's values. Without this the change is a jump. See
+    /// [`FocusTransition`].
+    focus_transition: Option<FocusTransition>,
+
+    /// The focus-dependent rule values this tile last resolved.
+    ///
+    /// Kept so that `update_window()` can tell an actual change from the many other reasons it
+    /// is called, and start a transition only for the former.
+    last_focus_values: FocusValues,
 
     /// Offset during the initial interactive move rubberband.
     pub(super) interactive_move_offset: Point<f64, Logical>,
@@ -174,6 +188,60 @@ pub(super) struct AlphaAnimation {
     offscreen: OffscreenBuffer,
 }
 
+/// The focus-dependent rule values a tile renders, as plain numbers.
+///
+/// Only what can be moved through continuously lives here. `on` is a boolean in the config, so
+/// it is carried as `shadow_alpha`: a shadow being turned off is a shadow fading out, which is
+/// the only reading of "off" that can be animated at all. Colour is deliberately absent — it
+/// changes with the *active* state rather than with the rules, and blending two colours is a
+/// separate concern from this transition.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FocusValues {
+    opacity: f64,
+    shadow_alpha: f64,
+    shadow_softness: f64,
+    shadow_spread: f64,
+    shadow_offset: Point<f64, Logical>,
+}
+
+impl FocusValues {
+    fn resolve(rules: &ResolvedWindowRules, shadow: &niri_config::Shadow) -> Self {
+        Self {
+            opacity: rules.opacity.unwrap_or(1.).clamp(0., 1.) as f64,
+            shadow_alpha: if shadow.on { 1. } else { 0. },
+            shadow_softness: shadow.softness,
+            shadow_spread: shadow.spread,
+            shadow_offset: Point::from((shadow.offset.x.0, shadow.offset.y.0)),
+        }
+    }
+
+    /// Where this tile is between `self` and `to`, at `p` in `0..=1`.
+    fn lerp(self, to: Self, p: f64) -> Self {
+        let mix = |from: f64, to: f64| from * (1. - p) + to * p;
+        Self {
+            opacity: mix(self.opacity, to.opacity),
+            shadow_alpha: mix(self.shadow_alpha, to.shadow_alpha),
+            shadow_softness: mix(self.shadow_softness, to.shadow_softness),
+            shadow_spread: mix(self.shadow_spread, to.shadow_spread),
+            shadow_offset: Point::from((
+                mix(self.shadow_offset.x, to.shadow_offset.x),
+                mix(self.shadow_offset.y, to.shadow_offset.y),
+            )),
+        }
+    }
+}
+
+/// One run from the values a tile was rendering to the ones its rules now ask for.
+///
+/// The starting point is whatever was on screen, not the previous rule's values, so a focus
+/// change that interrupts another one continues from where it had got to instead of snapping
+/// back to begin again.
+#[derive(Debug)]
+struct FocusTransition {
+    anim: Animation,
+    from: FocusValues,
+}
+
 impl<W: LayoutElement> Tile<W> {
     pub fn new(
         window: W,
@@ -187,6 +255,9 @@ impl<W: LayoutElement> Tile<W> {
         let focus_ring_config = options.layout.focus_ring.merged_with(&rules.focus_ring);
         let shadow_config = options.layout.shadow.merged_with(&rules.shadow);
         let sizing_mode = window.sizing_mode();
+        // A tile starts already at its values rather than transitioning into them: a window
+        // that opens focused should not fade its shadow in from nothing.
+        let last_focus_values = FocusValues::resolve(&rules, &shadow_config);
 
         Self {
             window,
@@ -205,6 +276,8 @@ impl<W: LayoutElement> Tile<W> {
             move_x_animation: None,
             move_y_animation: None,
             alpha_animation: None,
+            focus_transition: None,
+            last_focus_values,
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
@@ -402,12 +475,40 @@ impl<W: LayoutElement> Tile<W> {
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
         self.shadow.update_config(shadow_config);
 
+        // Focus-dependent rules have just been resolved, possibly to different values. Start
+        // from whatever is on screen right now rather than from the rule this is replacing, so
+        // that refocusing mid-transition continues instead of snapping back.
+        let target = FocusValues::resolve(&rules, &shadow_config);
+        if target != self.last_focus_values {
+            let config = self.options.animations.window_focus_change.0;
+            let from = self.current_focus_values();
+            self.last_focus_values = target;
+            self.focus_transition = Some(FocusTransition {
+                anim: Animation::new(self.clock.clone(), 0., 1., 0., config),
+                from,
+            });
+        }
+
         let window_size = self.window_size();
         let radius = self
             .window
             .geometry_corner_radius()
             .fit_to(window_size.w as f32, window_size.h as f32);
         self.rounded_corner_damage.set_corner_radius(radius);
+    }
+
+    /// The focus-dependent values to render this frame.
+    ///
+    /// Mid-transition this is a point between where the tile was and where its rules now point;
+    /// otherwise it is simply the rules' own values.
+    fn current_focus_values(&self) -> FocusValues {
+        match &self.focus_transition {
+            Some(transition) => {
+                let p = transition.anim.clamped_value().clamp(0., 1.);
+                transition.from.lerp(self.last_focus_values, p)
+            }
+            None => self.last_focus_values,
+        }
     }
 
     pub fn advance_animations(&mut self) {
@@ -439,6 +540,12 @@ impl<W: LayoutElement> Tile<W> {
                 self.alpha_animation = None;
             }
         }
+
+        if let Some(transition) = &mut self.focus_transition {
+            if transition.anim.is_done() {
+                self.focus_transition = None;
+            }
+        }
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
@@ -454,6 +561,12 @@ impl<W: LayoutElement> Tile<W> {
                 .alpha_animation
                 .as_ref()
                 .is_some_and(|alpha| !alpha.anim.is_done())
+            // Without this the transition stops being drawn partway: nothing else asks for a
+            // redraw while only opacity and shadow are still moving.
+            || self
+                .focus_transition
+                .as_ref()
+                .is_some_and(|transition| !transition.anim.is_done())
     }
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
@@ -511,12 +624,26 @@ impl<W: LayoutElement> Tile<W> {
                 .geometry_corner_radius()
                 .scaled_by(1. - expanded_progress as f32)
         };
+        // Mid-transition the shadow is drawn from interpolated geometry, and its presence is
+        // carried by alpha: `on` cannot be half-set, but a shadow can be half-there.
+        let focus = self.current_focus_values();
+        if self.focus_transition.is_some() {
+            let mut shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
+            // Keep drawing while either end of the transition wants a shadow, or the fade has
+            // nothing to draw itself onto.
+            shadow_config.on = shadow_config.on || focus.shadow_alpha > 0.;
+            shadow_config.softness = focus.shadow_softness;
+            shadow_config.spread = focus.shadow_spread;
+            shadow_config.offset.x.0 = focus.shadow_offset.x;
+            shadow_config.offset.y.0 = focus.shadow_offset.y;
+            self.shadow.update_config(shadow_config);
+        }
         self.shadow.update_render_elements(
             animated_tile_size,
             is_active,
             radius,
             self.scale,
-            1. - expanded_progress as f32,
+            (1. - expanded_progress) as f32 * focus.shadow_alpha as f32,
         );
 
         let draw_focus_ring_with_background = if self.border.is_off() {
@@ -559,13 +686,24 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn start_open_animation(&mut self) {
-        self.open_animation = Some(OpenAnimation::new(Animation::new(
-            self.clock.clone(),
-            0.,
-            1.,
-            0.,
-            self.options.animations.window_open.anim,
-        )));
+        self.start_open_animation_from(None);
+    }
+
+    /// Starts the open animation, optionally growing out of a shell-owned bubble rectangle.
+    ///
+    /// `travel_from` is in the tile's own render space, matching the `location` used when the
+    /// open animation renders.
+    pub fn start_open_animation_from(&mut self, travel_from: Option<Rectangle<f64, Logical>>) {
+        self.open_animation = Some(OpenAnimation::with_travel(
+            Animation::new(
+                self.clock.clone(),
+                0.,
+                1.,
+                0.,
+                self.options.animations.window_open.anim,
+            ),
+            travel_from,
+        ));
     }
 
     pub fn resize_animation(&self) -> Option<&Animation> {
@@ -1038,7 +1176,9 @@ impl<W: LayoutElement> Tile<W> {
         let win_alpha = if self.window.is_ignoring_opacity_window_rule() {
             1.
         } else {
-            let alpha = self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.);
+            // From the transition rather than the rule directly, so a focus change eases
+            // instead of stepping. Settled tiles get exactly the rule's own value back.
+            let alpha = self.current_focus_values().opacity as f32;
 
             // Interpolate towards alpha = 1. at fullscreen.
             let p = fullscreen_progress as f32;

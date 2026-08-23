@@ -148,6 +148,20 @@ pub enum Action {
     CloseWindow,
     #[knuffel(skip)]
     CloseWindowById(u64),
+    MinimizeWindow,
+    #[knuffel(skip)]
+    MinimizeWindowById(u64),
+    #[knuffel(skip)]
+    RestoreWindow(u64),
+    /// Minimize with an action-scoped presentation hint.
+    ///
+    /// This is deliberately unreachable from a key bind: a transition anchor is owned by the
+    /// shell that draws the bubble, so it can only arrive over IPC.
+    #[knuffel(skip)]
+    MinimizeWindowWithTransition(Option<u64>, niri_ipc::WindowTransition),
+    /// Restore with an action-scoped presentation hint. Also IPC-only.
+    #[knuffel(skip)]
+    RestoreWindowWithTransition(u64, niri_ipc::WindowTransition),
     FullscreenWindow,
     #[knuffel(skip)]
     FullscreenWindowById(u64),
@@ -431,6 +445,26 @@ impl From<niri_ipc::Action> for Action {
             }
             niri_ipc::Action::CloseWindow { id: None } => Self::CloseWindow,
             niri_ipc::Action::CloseWindow { id: Some(id) } => Self::CloseWindowById(id),
+            niri_ipc::Action::MinimizeWindow {
+                id,
+                transition: Some(transition),
+            } => Self::MinimizeWindowWithTransition(id, transition),
+            niri_ipc::Action::MinimizeWindow {
+                id: None,
+                transition: None,
+            } => Self::MinimizeWindow,
+            niri_ipc::Action::MinimizeWindow {
+                id: Some(id),
+                transition: None,
+            } => Self::MinimizeWindowById(id),
+            niri_ipc::Action::RestoreWindow {
+                id,
+                transition: Some(transition),
+            } => Self::RestoreWindowWithTransition(id, transition),
+            niri_ipc::Action::RestoreWindow {
+                id,
+                transition: None,
+            } => Self::RestoreWindow(id),
             niri_ipc::Action::FullscreenWindow { id: None } => Self::FullscreenWindow,
             niri_ipc::Action::FullscreenWindow { id: Some(id) } => Self::FullscreenWindowById(id),
             niri_ipc::Action::ToggleWindowedFullscreen { id: None } => {
@@ -1042,6 +1076,69 @@ impl FromStr for Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_experimental_minimization_actions_from_ipc() {
+        assert_eq!(
+            Action::from(niri_ipc::Action::MinimizeWindow {
+                id: None,
+                transition: None
+            }),
+            Action::MinimizeWindow
+        );
+        assert_eq!(
+            Action::from(niri_ipc::Action::MinimizeWindow {
+                id: Some(42),
+                transition: None
+            }),
+            Action::MinimizeWindowById(42)
+        );
+        assert_eq!(
+            Action::from(niri_ipc::Action::RestoreWindow {
+                id: 42,
+                transition: None
+            }),
+            Action::RestoreWindow(42)
+        );
+    }
+
+    #[test]
+    fn converts_transition_bearing_minimization_actions_from_ipc() {
+        let anchor = niri_ipc::BubbleAnchor {
+            output: String::from("DP-1"),
+            x: 1874.,
+            y: 9.,
+            width: 22.,
+            height: 22.,
+        };
+        let anchored = niri_ipc::WindowTransition::Anchored {
+            anchor: anchor.clone(),
+        };
+
+        // A transition routes to the dedicated variants, so the plain bind-reachable variants
+        // keep meaning exactly what they meant before protocol v2.
+        assert_eq!(
+            Action::from(niri_ipc::Action::MinimizeWindow {
+                id: None,
+                transition: Some(anchored.clone())
+            }),
+            Action::MinimizeWindowWithTransition(None, anchored.clone())
+        );
+        assert_eq!(
+            Action::from(niri_ipc::Action::MinimizeWindow {
+                id: Some(42),
+                transition: Some(niri_ipc::WindowTransition::Disabled)
+            }),
+            Action::MinimizeWindowWithTransition(Some(42), niri_ipc::WindowTransition::Disabled)
+        );
+        assert_eq!(
+            Action::from(niri_ipc::Action::RestoreWindow {
+                id: 42,
+                transition: Some(anchored.clone())
+            }),
+            Action::RestoreWindowWithTransition(42, anchored)
+        );
+    }
 
     #[test]
     fn parse_xf86_screensaver() {

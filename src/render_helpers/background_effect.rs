@@ -36,6 +36,11 @@ pub struct Options {
     pub xray: bool,
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
+    /// Per-surface blur strength overrides; `None` falls back to the global
+    /// `blur {}` settings. Only meaningful for the non-xray path: the xray
+    /// backdrop is blurred once for the whole output.
+    pub passes: Option<u8>,
+    pub offset: Option<f64>,
 }
 
 impl Options {
@@ -126,6 +131,8 @@ impl BackgroundEffect {
             xray: effect.xray == Some(true),
             noise: effect.noise,
             saturation: effect.saturation,
+            passes: effect.passes,
+            offset: effect.offset,
         };
 
         // If we have some background effect but xray wasn't explicitly set, default it to true
@@ -170,7 +177,15 @@ impl BackgroundEffect {
         // Use noise/saturation from options, falling back to blur defaults if blurred, and
         // to no effect if not blurred.
         let blur = self.options.blur && !self.blur_config.off;
-        let blur_options = blur.then_some(BlurOptions::from(self.blur_config));
+        let mut blur_options = blur.then_some(BlurOptions::from(self.blur_config));
+        if let Some(opts) = &mut blur_options {
+            if let Some(passes) = self.options.passes {
+                opts.passes = passes;
+            }
+            if let Some(offset) = self.options.offset {
+                opts.offset = offset;
+            }
+        }
         let noise = if blur { self.blur_config.noise } else { 0. };
         let noise = self.options.noise.unwrap_or(noise) as f32;
         let saturation = if blur {

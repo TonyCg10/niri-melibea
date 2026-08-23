@@ -20,6 +20,12 @@ use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
 #[derive(Debug)]
 pub struct OpenAnimation {
     anim: Animation,
+
+    /// Where the window should travel from, in the same space as the render `location`.
+    ///
+    /// `None` keeps niri's ordinary in-place open visual. `Some` starts the window at a
+    /// shell-owned bubble rectangle and grows it into its real tile geometry.
+    travel_from: Option<Rectangle<f64, Logical>>,
     random_seed: f32,
     buffer: OffscreenBuffer,
 }
@@ -33,8 +39,14 @@ niri_render_elements! {
 
 impl OpenAnimation {
     pub fn new(anim: Animation) -> Self {
+        Self::with_travel(anim, None)
+    }
+
+    /// Creates an open animation that grows out of `travel_from`.
+    pub fn with_travel(anim: Animation, travel_from: Option<Rectangle<f64, Logical>>) -> Self {
         Self {
             anim,
+            travel_from,
             random_seed: fastrand::f32(),
             buffer: OffscreenBuffer::default(),
         }
@@ -62,6 +74,36 @@ impl OpenAnimation {
             .buffer
             .render(renderer, scale, elements)
             .context("error rendering to offscreen buffer")?;
+
+        // An anchored restore grows out of the shell's bubble rectangle. Like the anchored close,
+        // it skips the open shader, whose effect assumes a window appearing in place.
+        if let Some(origin) = self.travel_from {
+            let elem = elem.with_alpha(clamped_progress as f32 * alpha);
+
+            let center = geo_size.to_point().downscale(2.);
+            let end_center = location + center;
+            let start_center = origin.loc + origin.size.to_point().downscale(2.);
+            let current_center =
+                start_center + (end_center - start_center).upscale(clamped_progress);
+
+            let grow = f64::min(origin.size.w / geo_size.w, origin.size.h / geo_size.h);
+            let factor = (grow + (1. - grow) * clamped_progress).max(0.);
+
+            let elem = RescaleRenderElement::from_element(
+                elem,
+                center.to_physical_precise_round(scale),
+                factor,
+            );
+
+            let location = current_center - center;
+            let elem = RelocateRenderElement::from_element(
+                elem,
+                location.to_physical_precise_round(scale),
+                Relocate::Relative,
+            );
+
+            return Ok((elem.into(), data));
+        }
 
         if Shaders::get(renderer).program(ProgramType::Open).is_some() {
             // OffscreenBuffer renders with Transform::Normal and the scale that we passed, so we

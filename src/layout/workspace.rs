@@ -25,7 +25,7 @@ use super::shadow::Shadow;
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
     ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
-    RemovedTile, SizeFrac,
+    RemovedTile, RestoreAnchor, SizeFrac,
 };
 use crate::animation::Clock;
 use crate::niri_render_elements;
@@ -464,6 +464,48 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating.has_window(id)
     }
 
+    pub(super) fn capture_restore_anchor(&self, id: &W::Id) -> Option<RestoreAnchor<W::Id>> {
+        if self.floating.has_window(id) {
+            let ids = self
+                .floating
+                .tiles()
+                .map(|tile| tile.window().id().clone())
+                .collect::<Vec<_>>();
+            let stack_idx = ids.iter().position(|candidate| candidate == id)?;
+            return Some(RestoreAnchor::Floating {
+                stack_idx,
+                above: ids[..stack_idx].iter().rev().cloned().collect(),
+                below: ids[stack_idx + 1..].to_vec(),
+            });
+        }
+
+        let columns = self.scrolling.columns().collect::<Vec<_>>();
+        let (column_idx, column) = columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.contains(id))?;
+        let ids = column
+            .tiles()
+            .map(|(tile, _)| tile.window().id().clone())
+            .collect::<Vec<_>>();
+        let tile_idx = ids.iter().position(|candidate| candidate == id)?;
+
+        let column_ids = |column: &&Column<W>| {
+            column
+                .tiles()
+                .map(|(tile, _)| tile.window().id().clone())
+                .collect::<Vec<_>>()
+        };
+
+        Some(RestoreAnchor::Tiled {
+            column_idx,
+            same_column_above: ids[..tile_idx].iter().rev().cloned().collect(),
+            same_column_below: ids[tile_idx + 1..].to_vec(),
+            columns_left: columns[..column_idx].iter().rev().map(column_ids).collect(),
+            columns_right: columns[column_idx + 1..].iter().map(column_ids).collect(),
+        })
+    }
+
     pub fn current_output(&self) -> Option<&Output> {
         self.output.as_ref()
     }
@@ -690,6 +732,154 @@ impl<W: LayoutElement> Workspace<W> {
                 }
             }
         }
+    }
+
+    pub(super) fn add_restored_tile(
+        &mut self,
+        mut tile: Tile<W>,
+        anchor: &RestoreAnchor<W::Id>,
+        width: ColumnWidth,
+        is_full_width: bool,
+        is_floating: bool,
+    ) {
+        if let RestoreAnchor::Floating {
+            stack_idx,
+            above,
+            below,
+        } = anchor
+        {
+            if is_floating && tile.window().pending_sizing_mode().is_normal() {
+                let find = |candidate: &W::Id| {
+                    self.floating
+                        .tiles()
+                        .position(|tile| tile.window().id() == candidate)
+                };
+                let nearest_above = above.iter().enumerate().find_map(|(distance, candidate)| {
+                    find(candidate).map(|idx| (distance, idx + 1))
+                });
+                let nearest_below = below
+                    .iter()
+                    .enumerate()
+                    .find_map(|(distance, candidate)| find(candidate).map(|idx| (distance, idx)));
+                // On an equal original distance, prefer the lower neighbor.
+                let relational_idx = match (nearest_above, nearest_below) {
+                    (Some(above), Some(below)) => {
+                        Some(if above.0 < below.0 { above.1 } else { below.1 })
+                    }
+                    (Some(above), None) => Some(above.1),
+                    (None, Some(below)) => Some(below.1),
+                    (None, None) => None,
+                };
+                let idx = relational_idx.unwrap_or((*stack_idx).min(self.floating.tiles().count()));
+
+                self.enter_output_for_window(tile.window());
+                tile.restore_to_floating = true;
+                self.floating.add_tile_at(idx, tile, true);
+                self.floating_is_active = FloatingActive::Yes;
+                return;
+            }
+        }
+
+        let RestoreAnchor::Tiled {
+            column_idx,
+            same_column_above,
+            same_column_below,
+            columns_left,
+            columns_right,
+        } = anchor
+        else {
+            self.add_tile(
+                tile,
+                WorkspaceAddWindowTarget::Auto,
+                ActivateWindow::Yes,
+                width,
+                is_full_width,
+                is_floating,
+            );
+            return;
+        };
+
+        let locate = |candidate: &W::Id| {
+            self.scrolling
+                .columns()
+                .enumerate()
+                .find_map(|(column_idx, column)| {
+                    column
+                        .position(candidate)
+                        .map(|tile_idx| (column_idx, tile_idx))
+                })
+        };
+
+        let nearest_above =
+            same_column_above
+                .iter()
+                .enumerate()
+                .find_map(|(distance, candidate)| {
+                    locate(candidate).map(|(column, tile)| (distance, (column, tile + 1)))
+                });
+        let nearest_below =
+            same_column_below
+                .iter()
+                .enumerate()
+                .find_map(|(distance, candidate)| {
+                    locate(candidate).map(|position| (distance, position))
+                });
+        // On an equal original distance, prefer the lower neighbor.
+        let in_column = match (nearest_above, nearest_below) {
+            (Some(above), Some(below)) => Some(if above.0 < below.0 { above.1 } else { below.1 }),
+            (Some(above), None) => Some(above.1),
+            (None, Some(below)) => Some(below.1),
+            (None, None) => None,
+        };
+
+        self.enter_output_for_window(tile.window());
+        tile.restore_to_floating = is_floating;
+
+        if let Some((column_idx, tile_idx)) = in_column {
+            self.scrolling
+                .add_tile_to_column(column_idx, Some(tile_idx), tile, true);
+        } else {
+            let nearest_left =
+                columns_left
+                    .iter()
+                    .enumerate()
+                    .find_map(|(distance, candidates)| {
+                        candidates
+                            .iter()
+                            .find_map(locate)
+                            .map(|position| (distance, position))
+                    });
+            let nearest_right =
+                columns_right
+                    .iter()
+                    .enumerate()
+                    .find_map(|(distance, candidates)| {
+                        candidates
+                            .iter()
+                            .find_map(locate)
+                            .map(|position| (distance, position))
+                    });
+            // On an equal original distance, prefer the left neighbor.
+            let relational_idx = match (nearest_left, nearest_right) {
+                (
+                    Some((left_distance, (left_column, _))),
+                    Some((right_distance, (right_column, _))),
+                ) => Some(if left_distance <= right_distance {
+                    left_column + 1
+                } else {
+                    right_column
+                }),
+                (Some((_, (left_column, _))), None) => Some(left_column + 1),
+                (None, Some((_, (right_column, _)))) => Some(right_column),
+                (None, None) => None,
+            };
+            let fallback_idx = (*column_idx).min(self.scrolling.columns().count());
+            let column_idx = relational_idx.unwrap_or(fallback_idx);
+            self.scrolling
+                .add_tile(Some(column_idx), tile, true, width, is_full_width, None);
+        }
+
+        self.floating_is_active = FloatingActive::No;
     }
 
     pub fn add_tile_to_column(
@@ -1726,14 +1916,15 @@ impl<W: LayoutElement> Workspace<W> {
         &mut self,
         renderer: &mut GlesRenderer,
         window: &W::Id,
+        travel_to: Option<Rectangle<f64, Logical>>,
         blocker: TransactionBlocker,
     ) {
         if self.floating.has_window(window) {
             self.floating
-                .start_close_animation_for_window(renderer, window, blocker);
+                .start_close_animation_for_window(renderer, window, travel_to, blocker);
         } else {
             self.scrolling
-                .start_close_animation_for_window(renderer, window, blocker);
+                .start_close_animation_for_window(renderer, window, travel_to, blocker);
         }
     }
 
@@ -1743,14 +1934,21 @@ impl<W: LayoutElement> Workspace<W> {
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
+        travel_to: Option<Rectangle<f64, Logical>>,
         blocker: TransactionBlocker,
     ) {
-        self.floating
-            .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.floating.start_close_animation_for_tile(
+            renderer, snapshot, tile_size, tile_pos, travel_to, blocker,
+        );
     }
 
-    pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
-        self.scrolling.start_open_animation(id) || self.floating.start_open_animation(id)
+    pub fn start_open_animation(
+        &mut self,
+        id: &W::Id,
+        travel_from: Option<Rectangle<f64, Logical>>,
+    ) -> bool {
+        self.scrolling.start_open_animation(id, travel_from)
+            || self.floating.start_open_animation(id, travel_from)
     }
 
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {

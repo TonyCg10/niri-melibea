@@ -9,7 +9,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
-use crate::{Cast, Event, KeyboardLayouts, Window, Workspace};
+use crate::{Cast, Event, KeyboardLayouts, MinimizedWindow, Window, Workspace};
 
 /// Part of the state communicated via the event stream.
 pub trait EventStreamStatePart {
@@ -38,6 +38,9 @@ pub struct EventStreamState {
     /// State of workspaces.
     pub windows: WindowsState,
 
+    /// State of windows held outside visible workspaces.
+    pub minimized_windows: MinimizedWindowsState,
+
     /// State of the keyboard layouts.
     pub keyboard_layouts: KeyboardLayoutsState,
 
@@ -63,6 +66,13 @@ pub struct WorkspacesState {
 pub struct WindowsState {
     /// Map from a window id to the window.
     pub windows: HashMap<u64, Window>,
+}
+
+/// Minimized window state communicated over the event stream.
+#[derive(Debug, Default)]
+pub struct MinimizedWindowsState {
+    /// Ordered windows held outside visible workspaces.
+    pub windows: Vec<MinimizedWindow>,
 }
 
 /// The keyboard layout state communicated over the event stream.
@@ -98,6 +108,7 @@ impl EventStreamStatePart for EventStreamState {
         let mut events = Vec::new();
         events.extend(self.workspaces.replicate());
         events.extend(self.windows.replicate());
+        events.extend(self.minimized_windows.replicate());
         events.extend(self.keyboard_layouts.replicate());
         events.extend(self.overview.replicate());
         events.extend(self.config.replicate());
@@ -108,11 +119,28 @@ impl EventStreamStatePart for EventStreamState {
     fn apply(&mut self, event: Event) -> Option<Event> {
         let event = self.workspaces.apply(event)?;
         let event = self.windows.apply(event)?;
+        let event = self.minimized_windows.apply(event)?;
         let event = self.keyboard_layouts.apply(event)?;
         let event = self.overview.apply(event)?;
         let event = self.config.apply(event)?;
         let event = self.casts.apply(event)?;
         Some(event)
+    }
+}
+
+impl EventStreamStatePart for MinimizedWindowsState {
+    fn replicate(&self) -> Vec<Event> {
+        vec![Event::MinimizedWindowsChanged {
+            windows: self.windows.clone(),
+        }]
+    }
+
+    fn apply(&mut self, event: Event) -> Option<Event> {
+        match event {
+            Event::MinimizedWindowsChanged { windows } => self.windows = windows,
+            event => return Some(event),
+        }
+        None
     }
 }
 
@@ -319,5 +347,44 @@ impl EventStreamStatePart for CastsState {
             event => return Some(event),
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventStreamStatePart, MinimizedWindowsState};
+    use crate::{Event, MinimizedWindow};
+
+    fn window(id: u64) -> MinimizedWindow {
+        MinimizedWindow {
+            id,
+            title: Some(format!("window-{id}")),
+            app_id: Some("org.example.App".to_owned()),
+            pid: Some(100),
+            is_urgent: false,
+            focus_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn minimized_snapshot_replaces_ordered_state_and_replicates() {
+        let windows = vec![window(20), window(10)];
+        let mut state = MinimizedWindowsState::default();
+
+        assert!(state
+            .apply(Event::MinimizedWindowsChanged {
+                windows: windows.clone(),
+            })
+            .is_none());
+        assert_eq!(state.windows, windows);
+
+        let events = state.replicate();
+        let [Event::MinimizedWindowsChanged {
+            windows: replicated,
+        }] = events.as_slice()
+        else {
+            panic!("expected one minimized-window snapshot");
+        };
+        assert_eq!(replicated, &state.windows);
     }
 }

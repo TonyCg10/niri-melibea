@@ -908,6 +908,12 @@ mod tests {
             layer-rule {
                 match namespace="^notifications$"
                 block-out-from "screencast"
+                background-effect {
+                    blur true
+                    xray false
+                    passes 2
+                    offset 5
+                }
             }
 
             binds {
@@ -1576,6 +1582,17 @@ mod tests {
                     },
                     custom_shader: None,
                 },
+                window_focus_change: WindowFocusChangeAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 150,
+                                curve: EaseOutQuad,
+                            },
+                        ),
+                    },
+                ),
                 config_notification_open_close: ConfigNotificationOpenCloseAnim(
                     Animation {
                         off: false,
@@ -1877,6 +1894,8 @@ mod tests {
                         blur: None,
                         noise: None,
                         saturation: None,
+                        passes: None,
+                        offset: None,
                     },
                     popups: PopupsRule {
                         opacity: None,
@@ -1886,6 +1905,8 @@ mod tests {
                             blur: None,
                             noise: None,
                             saturation: None,
+                            passes: None,
+                            offset: None,
                         },
                     },
                 },
@@ -1924,10 +1945,22 @@ mod tests {
                     place_within_backdrop: None,
                     baba_is_float: None,
                     background_effect: BackgroundEffectRule {
-                        xray: None,
-                        blur: None,
+                        xray: Some(
+                            false,
+                        ),
+                        blur: Some(
+                            true,
+                        ),
                         noise: None,
                         saturation: None,
+                        passes: Some(
+                            2,
+                        ),
+                        offset: Some(
+                            FloatOrInt(
+                                5.0,
+                            ),
+                        ),
                     },
                     popups: PopupsRule {
                         opacity: None,
@@ -1937,6 +1970,8 @@ mod tests {
                             blur: None,
                             noise: None,
                             saturation: None,
+                            passes: None,
+                            offset: None,
                         },
                     },
                 },

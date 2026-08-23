@@ -1065,6 +1065,10 @@ pub struct BackgroundEffectRule {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub passes: Option<u8>,
+    #[knuffel(child, unwrap(argument))]
+    pub offset: Option<FloatOrInt<0, 100>>,
 }
 
 /// Resolved background effect rule.
@@ -1087,11 +1091,18 @@ pub struct BackgroundEffect {
 
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
+
+    /// Blur strength overrides for this rule.
+    ///
+    /// - `None`: use the global `blur {}` settings
+    /// - `Some(x)`: override for surfaces matching this rule
+    pub passes: Option<u8>,
+    pub offset: Option<f64>,
 }
 
 impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
     fn merge_with(&mut self, part: &BackgroundEffectRule) {
-        merge_clone_opt!((self, part), xray, blur);
+        merge_clone_opt!((self, part), xray, blur, passes);
 
         if let Some(x) = part.noise {
             self.noise = Some(x.0);
@@ -1099,6 +1110,10 @@ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
 
         if let Some(x) = part.saturation {
             self.saturation = Some(x.0);
+        }
+
+        if let Some(x) = part.offset {
+            self.offset = Some(x.0);
         }
     }
 }

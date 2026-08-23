@@ -191,6 +191,9 @@ impl CompositorHandler for State {
                                 || output.as_ref() == *parent_output
                         })
                         .map(|(mapped, _)| mapped.window.clone());
+                    let parent_is_minimized = parent
+                        .as_ref()
+                        .is_some_and(|parent| self.niri.layout.is_minimized(parent));
 
                     // The mapped pre-commit hook deals with dma-bufs on its own.
                     self.remove_default_dmabuf_pre_commit_hook(surface);
@@ -201,7 +204,17 @@ impl CompositorHandler for State {
                     };
                     let window = mapped.window.clone();
 
-                    let target = if let Some(p) = &parent {
+                    let activate = if parent_is_minimized {
+                        ActivateWindow::No
+                    } else {
+                        activate
+                    };
+                    let target = if parent_is_minimized {
+                        // A minimized parent has no visible workspace, so
+                        // NextTo would be invalid. Add synchronously and retain
+                        // the child before this commit can be rendered.
+                        AddWindowTarget::Auto
+                    } else if let Some(p) = &parent {
                         // Open dialogs next to their parent window.
                         AddWindowTarget::NextTo(p)
                     } else if let Some(id) = workspace_id {
@@ -220,7 +233,19 @@ impl CompositorHandler for State {
                         is_floating,
                         activate,
                     );
-                    let output = output.cloned();
+                    let mut output = output.cloned();
+                    if parent_is_minimized {
+                        let attached = parent.as_ref().is_some_and(|parent| {
+                            self.niri
+                                .layout
+                                .reconcile_minimized_parent(&window, Some(parent))
+                        });
+                        if attached {
+                            output = None;
+                        } else {
+                            error!("could not attach new transient to minimized parent family");
+                        }
+                    }
 
                     // The window state cannot contain Fullscreen and Maximized at once. Therefore,
                     // if the window ended up fullscreen, then we only know that it is also
@@ -276,7 +301,7 @@ impl CompositorHandler for State {
                     self.backend.with_primary_renderer(|renderer| {
                         self.niri
                             .layout
-                            .start_close_animation_for_window(renderer, &window, blocker);
+                            .start_close_animation_for_window(renderer, &window, None, blocker);
                     });
                 }
 

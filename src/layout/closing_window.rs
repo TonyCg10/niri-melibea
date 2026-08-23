@@ -56,6 +56,12 @@ pub struct ClosingWindow {
     /// How much the blocked-out texture should be offset.
     blocked_out_buffer_offset: Point<f64, Logical>,
 
+    /// Where the window should travel to, in the same space as `pos`.
+    ///
+    /// `None` keeps niri's ordinary in-place close visual. `Some` replaces it with a
+    /// compositor-local trajectory toward a shell-owned bubble rectangle.
+    travel_to: Option<Rectangle<f64, Logical>>,
+
     /// The closing animation.
     anim_state: AnimationState,
 
@@ -94,12 +100,14 @@ impl AnimationState {
 }
 
 impl ClosingWindow {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<E: RenderElement<GlesRenderer>>(
         renderer: &mut GlesRenderer,
         snapshot: RenderSnapshot<E, E>,
         scale: Scale<f64>,
         geo_size: Size<f64, Logical>,
         pos: Point<f64, Logical>,
+        travel_to: Option<Rectangle<f64, Logical>>,
         blocker: TransactionBlocker,
         anim: Animation,
     ) -> anyhow::Result<Self> {
@@ -149,6 +157,7 @@ impl ClosingWindow {
             block_out_from: snapshot.block_out_from,
             geo_size,
             pos,
+            travel_to,
             buffer_offset,
             buffer_with_blocked_out_bg_offset,
             blocked_out_buffer_offset,
@@ -223,6 +232,13 @@ impl ClosingWindow {
         let progress = anim.value();
         let clamped_progress = anim.clamped_value().clamp(0., 1.);
 
+        // An anchored close travels toward a shell-owned bubble rectangle. It deliberately skips
+        // the close shader: that shader is a dissolve authored for a window staying where it is,
+        // and it would fight a trajectory rather than compose with one.
+        if let Some(target) = self.travel_to {
+            return self.render_travel(buffer, offset, view_rect, scale, clamped_progress, target);
+        }
+
         if Shaders::get(ctx.renderer)
             .program(ProgramType::Close)
             .is_some()
@@ -291,6 +307,65 @@ impl ClosingWindow {
 
         let mut location = self.pos + offset;
         location.x -= view_rect.loc.x;
+        let elem = RelocateRenderElement::from_element(
+            elem,
+            location.to_physical_precise_round(scale),
+            Relocate::Relative,
+        );
+
+        elem.into()
+    }
+
+    /// Renders one frame of an anchored trajectory toward `target`.
+    ///
+    /// `target` is view-local, while `self.pos` is content-space, so the window endpoint is
+    /// converted the same way the ordinary close path converts it. That keeps the bubble end of
+    /// the trajectory pinned to the screen even if the view scrolls mid-animation.
+    fn render_travel(
+        &self,
+        buffer: &TextureBuffer<GlesTexture>,
+        offset: Point<f64, Logical>,
+        view_rect: Rectangle<f64, Logical>,
+        scale: Scale<f64>,
+        progress: f64,
+        target: Rectangle<f64, Logical>,
+    ) -> ClosingWindowRenderElement {
+        let center = self.geo_size.to_point().downscale(2.);
+
+        let mut start = self.pos;
+        start.x -= view_rect.loc.x;
+        let start_center = start + center;
+        let end_center = target.loc + target.size.to_point().downscale(2.);
+
+        let current_center = start_center + (end_center - start_center).upscale(progress);
+
+        // A single factor keeps the aspect ratio intact; the smaller ratio guarantees the window
+        // fits inside the bubble rather than overflowing it at the end of the travel.
+        let shrink = f64::min(
+            target.size.w / self.geo_size.w,
+            target.size.h / self.geo_size.h,
+        );
+        let factor = (1. + (shrink - 1.) * progress).max(0.);
+
+        let elem = TextureRenderElement::from_texture_buffer(
+            buffer.clone(),
+            Point::from((0., 0.)),
+            1. - progress as f32,
+            None,
+            None,
+            Kind::Unspecified,
+        );
+
+        let elem = PrimaryGpuTextureRenderElement(elem);
+        let elem = RescaleRenderElement::from_element(
+            elem,
+            (center - offset).to_physical_precise_round(scale),
+            factor,
+        );
+
+        // Rescaling happens about the geometry centre, so placing the element is a matter of
+        // putting that centre on the interpolated point.
+        let location = current_center - center + offset;
         let elem = RelocateRenderElement::from_element(
             elem,
             location.to_physical_precise_round(scale),

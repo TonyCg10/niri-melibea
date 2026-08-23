@@ -14,6 +14,7 @@ pub struct Animations {
     pub horizontal_view_movement: HorizontalViewMovementAnim,
     pub window_movement: WindowMovementAnim,
     pub window_resize: WindowResizeAnim,
+    pub window_focus_change: WindowFocusChangeAnim,
     pub config_notification_open_close: ConfigNotificationOpenCloseAnim,
     pub exit_confirmation_open_close: ExitConfirmationOpenCloseAnim,
     pub screenshot_ui_open: ScreenshotUiOpenAnim,
@@ -32,6 +33,7 @@ impl Default for Animations {
             window_open: Default::default(),
             window_close: Default::default(),
             window_resize: Default::default(),
+            window_focus_change: Default::default(),
             config_notification_open_close: Default::default(),
             exit_confirmation_open_close: Default::default(),
             screenshot_ui_open: Default::default(),
@@ -59,6 +61,8 @@ pub struct AnimationsPart {
     pub horizontal_view_movement: Option<HorizontalViewMovementAnim>,
     #[knuffel(child)]
     pub window_movement: Option<WindowMovementAnim>,
+    #[knuffel(child)]
+    pub window_focus_change: Option<WindowFocusChangeAnim>,
     #[knuffel(child)]
     pub window_resize: Option<WindowResizeAnim>,
     #[knuffel(child)]
@@ -92,6 +96,7 @@ impl MergeWith<AnimationsPart> for Animations {
             horizontal_view_movement,
             window_movement,
             window_resize,
+            window_focus_change,
             config_notification_open_close,
             exit_confirmation_open_close,
             screenshot_ui_open,
@@ -220,6 +225,30 @@ impl Default for WindowMovementAnim {
                 damping_ratio: 1.,
                 stiffness: 800,
                 epsilon: 0.0001,
+            }),
+        })
+    }
+}
+
+/// How opacity and shadow follow a window gaining or losing focus.
+///
+/// Focus-dependent window rules resolve instantly: the moment a window stops being focused,
+/// its `opacity` and `shadow` are simply the other rule's values. This animation is what
+/// carries the tile from the values it was rendering to the ones the new rules ask for, so
+/// the change reads as a transition rather than a jump.
+///
+/// Eased rather than sprung by default: this is a cross-fade between two states, not
+/// something moving through space, so there is no momentum for a spring to express.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowFocusChangeAnim(pub Animation);
+
+impl Default for WindowFocusChangeAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 150,
+                curve: Curve::EaseOutQuad,
             }),
         })
     }
@@ -357,6 +386,21 @@ where
 }
 
 impl<S> knuffel::Decode<S> for WindowMovementAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for WindowFocusChangeAnim
 where
     S: knuffel::traits::ErrorSpan,
 {

@@ -853,7 +853,7 @@ impl XdgShellHandler for State {
         self.backend.with_primary_renderer(|renderer| {
             self.niri
                 .layout
-                .start_close_animation_for_window(renderer, &window, blocker);
+                .start_close_animation_for_window(renderer, &window, None, blocker);
         });
 
         let active_window = self.niri.layout.focus().map(|m| &m.window);
@@ -902,11 +902,34 @@ impl XdgShellHandler for State {
     }
 
     fn parent_changed(&mut self, toplevel: ToplevelSurface) {
-        let Some(parent) = toplevel.parent() else {
+        let child = self
+            .niri
+            .layout
+            .find_window_and_output(toplevel.wl_surface())
+            .map(|(mapped, _)| mapped.window.clone());
+        let parent_surface = toplevel.parent();
+        let parent = parent_surface
+            .as_ref()
+            .and_then(|surface| self.niri.layout.find_window_and_output(surface))
+            .map(|(mapped, _)| mapped.window.clone());
+
+        if let Some(child) = child {
+            if self
+                .niri
+                .layout
+                .reconcile_minimized_parent(&child, parent.as_ref())
+            {
+                self.niri.queue_redraw_all();
+                return;
+            }
+        }
+
+        let Some(parent_surface) = parent_surface else {
             return;
         };
 
-        if let Some((mapped, output)) = self.niri.layout.find_window_and_output_mut(&parent) {
+        if let Some((mapped, output)) = self.niri.layout.find_window_and_output_mut(&parent_surface)
+        {
             let output = output.cloned();
             let window = mapped.window.clone();
             if self.niri.layout.descendants_added(&window) {

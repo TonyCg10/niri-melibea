@@ -41,7 +41,7 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{
     Config, CornerRadius, LayoutPart, PresetSize, Workspace as WorkspaceConfig, WorkspaceReference,
 };
-use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
+use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout, WindowTransition};
 use scrolling::{Column, ColumnWidth};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
@@ -58,6 +58,7 @@ use self::workspace::{OutputId, Workspace};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
+use crate::layout::window_transition::ResolvedTransition;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::offscreen::OffscreenData;
@@ -85,6 +86,7 @@ pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
 pub mod tile;
+pub mod window_transition;
 pub mod workspace;
 
 #[cfg(test)]
@@ -336,6 +338,12 @@ pub trait LayoutElement {
 pub struct Layout<W: LayoutElement> {
     /// Monitors and workspaes in the layout.
     monitor_set: MonitorSet<W>,
+    /// Mapped windows deliberately held outside every visible workspace.
+    ///
+    /// These tiles remain alive and discoverable for surface lifecycle
+    /// handling, but are excluded from rendering, focus, overview and normal
+    /// window iteration.
+    minimized: Vec<MinimizedTile<W>>,
     /// Whether the layout should draw as active.
     ///
     /// This normally indicates that the layout has keyboard focus, but not always. E.g. when the
@@ -489,6 +497,7 @@ pub enum ConfigureIntent {
 }
 
 /// Tile that was just removed from the layout.
+#[derive(Debug)]
 pub struct RemovedTile<W: LayoutElement> {
     tile: Tile<W>,
     /// Width of the column the tile was in.
@@ -497,6 +506,44 @@ pub struct RemovedTile<W: LayoutElement> {
     is_full_width: bool,
     /// Whether the tile was floating.
     is_floating: bool,
+}
+
+/// A mapped tile held outside the visible layout for native minimization.
+#[derive(Debug)]
+struct MinimizedTile<W: LayoutElement> {
+    removed: RemovedTile<W>,
+    /// Publicly addressable root of this transient family.
+    group_leader: W::Id,
+    /// Output that owned the workspace at minimize time. Keeping this separate
+    /// from the workspace id lets restore distinguish an original workspace
+    /// from one that niri migrated after its output disappeared.
+    output_name: Option<String>,
+    /// Workspace to prefer on restore. Dynamic workspace cleanup may remove
+    /// it, in which case restore falls back to the active workspace.
+    workspace_id: WorkspaceId,
+    /// Surviving relationships to prefer over a raw layout index.
+    restore_anchor: RestoreAnchor<W::Id>,
+}
+
+/// Relational position of a tile before it leaves the visible layout.
+///
+/// Neighbor lists are ordered nearest-first. They make restoration stable when
+/// some intervening windows close or move while the tile is minimized; raw
+/// indices are only the final fallback.
+#[derive(Debug)]
+enum RestoreAnchor<Id> {
+    Tiled {
+        column_idx: usize,
+        same_column_above: Vec<Id>,
+        same_column_below: Vec<Id>,
+        columns_left: Vec<Vec<Id>>,
+        columns_right: Vec<Vec<Id>>,
+    },
+    Floating {
+        stack_idx: usize,
+        above: Vec<Id>,
+        below: Vec<Id>,
+    },
 }
 
 /// Whether to activate a newly added window.
@@ -695,6 +742,7 @@ impl<W: LayoutElement> Layout<W> {
     pub fn with_options(clock: Clock, options: Options) -> Self {
         Self {
             monitor_set: MonitorSet::NoOutputs { workspaces: vec![] },
+            minimized: Vec::new(),
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             interactive_move: None,
@@ -720,6 +768,7 @@ impl<W: LayoutElement> Layout<W> {
 
         Self {
             monitor_set: MonitorSet::NoOutputs { workspaces },
+            minimized: Vec::new(),
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             interactive_move: None,
@@ -1114,6 +1163,34 @@ impl<W: LayoutElement> Layout<W> {
         window: &W::Id,
         transaction: Transaction,
     ) -> Option<RemovedTile<W>> {
+        if let Some(idx) = self
+            .minimized
+            .iter()
+            .position(|minimized| minimized.removed.tile.window().id() == window)
+        {
+            let removed = self.minimized.remove(idx);
+            if removed.removed.tile.window().id() == &removed.group_leader {
+                if let Some(new_leader_idx) = self
+                    .minimized
+                    .iter()
+                    .position(|minimized| minimized.group_leader == removed.group_leader)
+                {
+                    let new_leader = self.minimized[new_leader_idx]
+                        .removed
+                        .tile
+                        .window()
+                        .id()
+                        .clone();
+                    for minimized in &mut self.minimized {
+                        if minimized.group_leader == removed.group_leader {
+                            minimized.group_leader = new_leader.clone();
+                        }
+                    }
+                }
+            }
+            return Some(removed.removed);
+        }
+
         if let Some(state) = &self.interactive_move {
             match state {
                 InteractiveMoveState::Starting { window_id, .. } => {
@@ -1204,6 +1281,335 @@ impl<W: LayoutElement> Layout<W> {
         None
     }
 
+    /// Removes a mapped window from every visible layout while retaining its
+    /// tile and surface lifecycle state.
+    ///
+    /// Returns `false` for unknown windows, already-minimized windows and
+    /// windows in an interactive move.
+    pub fn minimize_window(&mut self, window: &W::Id) -> bool {
+        let Some((family, group_leader)) = self.visible_minimization_family(window) else {
+            return false;
+        };
+        self.hold_visible_family(family, group_leader)
+    }
+
+    /// Windows that would leave the visible layout when `window` is minimized.
+    ///
+    /// The family is rooted at the highest visible transient ancestor and is
+    /// ordered root-first. An empty result means minimization is currently
+    /// ineligible.
+    pub fn minimization_family(&self, window: &W::Id) -> Vec<W::Id> {
+        self.visible_minimization_family(window)
+            .map(|(family, _)| family)
+            .unwrap_or_default()
+    }
+
+    fn visible_minimization_family(&self, window: &W::Id) -> Option<(Vec<W::Id>, W::Id)> {
+        if self.is_minimized(window) || self.interactive_move.is_some() {
+            return None;
+        }
+
+        let relations = self.visible_parent_relations();
+        let mut group_leader = relations
+            .iter()
+            .find(|(id, _)| id == window)
+            .map(|(id, _)| id.clone())?;
+
+        for _ in 0..relations.len() {
+            let Some(parent) = relations
+                .iter()
+                .find(|(id, _)| id == &group_leader)
+                .and_then(|(_, parent)| parent.clone())
+            else {
+                break;
+            };
+            group_leader = parent;
+        }
+
+        let family = Self::relation_subtree(&relations, &group_leader);
+        Some((family, group_leader))
+    }
+
+    /// Adds a newly mapped transient subtree to its already-minimized parent
+    /// family without exposing another public bubble.
+    pub fn minimize_window_with_parent(&mut self, window: &W::Id, parent: &W::Id) -> bool {
+        if self.is_minimized(window) || self.interactive_move.is_some() {
+            return false;
+        }
+
+        let Some(parent_minimized) = self
+            .minimized
+            .iter()
+            .find(|minimized| minimized.removed.tile.window().id() == parent)
+        else {
+            return false;
+        };
+        let group_leader = parent_minimized.group_leader.clone();
+        let is_direct_child = self
+            .windows()
+            .find(|(_, candidate)| candidate.id() == window)
+            .is_some_and(|(_, child)| child.is_child_of(parent_minimized.removed.tile.window()));
+        if !is_direct_child {
+            return false;
+        }
+
+        let relations = self.visible_parent_relations();
+        let family = Self::relation_subtree(&relations, window);
+        self.hold_visible_family(family, group_leader)
+    }
+
+    /// Reconciles a toplevel parent change with minimized-family ownership.
+    ///
+    /// A visible subtree joining a minimized parent is held immediately. A
+    /// minimized subtree that detaches remains minimized, but becomes its own
+    /// public family. Reparenting between minimized families merges the
+    /// subtree into the new parent's family.
+    pub fn reconcile_minimized_parent(&mut self, window: &W::Id, parent: Option<&W::Id>) -> bool {
+        if !self.is_minimized(window) {
+            return parent.is_some_and(|parent| {
+                self.is_minimized(parent) && self.minimize_window_with_parent(window, parent)
+            });
+        }
+
+        let old_leader = self
+            .minimized
+            .iter()
+            .find(|minimized| minimized.removed.tile.window().id() == window)
+            .expect("minimized window disappeared while reconciling its parent")
+            .group_leader
+            .clone();
+        let new_leader = parent
+            .and_then(|parent| {
+                self.minimized
+                    .iter()
+                    .find(|minimized| minimized.removed.tile.window().id() == parent)
+            })
+            .map(|minimized| minimized.group_leader.clone())
+            .unwrap_or_else(|| window.clone());
+
+        if old_leader == new_leader {
+            return false;
+        }
+
+        let relations = self.minimized_parent_relations();
+        let subtree = Self::relation_subtree(&relations, window);
+        for minimized in &mut self.minimized {
+            if subtree
+                .iter()
+                .any(|member| member == minimized.removed.tile.window().id())
+            {
+                minimized.group_leader = new_leader.clone();
+            }
+        }
+
+        let old_leader_still_exists = self.minimized.iter().any(|minimized| {
+            minimized.group_leader == old_leader
+                && minimized.removed.tile.window().id() == &old_leader
+        });
+        if !old_leader_still_exists {
+            if let Some(promoted) = self
+                .minimized
+                .iter()
+                .find(|minimized| minimized.group_leader == old_leader)
+                .map(|minimized| minimized.removed.tile.window().id().clone())
+            {
+                for minimized in &mut self.minimized {
+                    if minimized.group_leader == old_leader {
+                        minimized.group_leader = promoted.clone();
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    fn visible_parent_relations(&self) -> Vec<(W::Id, Option<W::Id>)> {
+        let windows = self.windows().map(|(_, window)| window).collect::<Vec<_>>();
+        windows
+            .iter()
+            .map(|child| {
+                let parent = windows
+                    .iter()
+                    .find(|parent| child.is_child_of(parent))
+                    .map(|parent| parent.id().clone());
+                (child.id().clone(), parent)
+            })
+            .collect()
+    }
+
+    fn minimized_parent_relations(&self) -> Vec<(W::Id, Option<W::Id>)> {
+        self.minimized
+            .iter()
+            .map(|child| {
+                let child = child.removed.tile.window();
+                let parent = self
+                    .minimized
+                    .iter()
+                    .map(|candidate| candidate.removed.tile.window())
+                    .find(|parent| child.is_child_of(parent))
+                    .map(|parent| parent.id().clone());
+                (child.id().clone(), parent)
+            })
+            .collect()
+    }
+
+    fn relation_subtree(relations: &[(W::Id, Option<W::Id>)], root: &W::Id) -> Vec<W::Id> {
+        let mut family = vec![root.clone()];
+        loop {
+            let mut changed = false;
+            for (id, parent) in relations {
+                if family.iter().any(|member| member == id) {
+                    continue;
+                }
+                if parent
+                    .as_ref()
+                    .is_some_and(|parent| family.iter().any(|member| member == parent))
+                {
+                    family.push(id.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        family
+    }
+
+    fn hold_visible_family(&mut self, family: Vec<W::Id>, group_leader: W::Id) -> bool {
+        let placements = family
+            .iter()
+            .map(|window| {
+                self.workspaces()
+                    .find_map(|(monitor, _, workspace)| {
+                        workspace
+                            .capture_restore_anchor(window)
+                            .map(|restore_anchor| {
+                                (
+                                    monitor.map(|monitor| monitor.output_name().clone()),
+                                    workspace.id(),
+                                    restore_anchor,
+                                )
+                            })
+                    })
+                    .map(|placement| (window.clone(), placement))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(placements) = placements else {
+            return false;
+        };
+
+        for (window, (output_name, workspace_id, restore_anchor)) in placements {
+            let mut removed = self
+                .remove_window(&window, Transaction::new())
+                .expect("visible transient family member disappeared during minimization");
+            removed.tile.stop_move_animations();
+            self.minimized.push(MinimizedTile {
+                removed,
+                group_leader: group_leader.clone(),
+                output_name,
+                workspace_id,
+                restore_anchor,
+            });
+        }
+        true
+    }
+
+    /// Restores one minimized transient family. The root is restored first and
+    /// descendants afterwards so a modal descendant receives final focus.
+    pub fn restore_window(&mut self, window: &W::Id) -> bool {
+        let Some(group_leader) = self
+            .minimized
+            .iter()
+            .find(|minimized| minimized.removed.tile.window().id() == window)
+            .map(|minimized| minimized.group_leader.clone())
+        else {
+            return false;
+        };
+
+        let mut group = Vec::new();
+        let mut idx = 0;
+        while idx < self.minimized.len() {
+            if self.minimized[idx].group_leader == group_leader {
+                group.push(self.minimized.remove(idx));
+            } else {
+                idx += 1;
+            }
+        }
+        group.sort_by_key(|minimized| minimized.removed.tile.window().id() != &group_leader);
+        for minimized in group {
+            self.restore_minimized_tile(minimized);
+        }
+        true
+    }
+
+    fn restore_minimized_tile(&mut self, minimized: MinimizedTile<W>) {
+        match &mut self.monitor_set {
+            MonitorSet::Normal {
+                monitors,
+                active_monitor_idx,
+                ..
+            } => {
+                let original_target =
+                    monitors
+                        .iter()
+                        .enumerate()
+                        .find_map(|(monitor_idx, monitor)| {
+                            let output_matches = minimized
+                                .output_name
+                                .as_ref()
+                                .is_none_or(|name| monitor.output_name() == name);
+                            (output_matches
+                                && monitor
+                                    .workspaces
+                                    .iter()
+                                    .any(|workspace| workspace.id() == minimized.workspace_id))
+                            .then_some((monitor_idx, minimized.workspace_id))
+                        });
+
+                let target = original_target.unwrap_or_else(|| {
+                    let monitor_idx = *active_monitor_idx;
+                    let workspace_idx = monitors[monitor_idx].active_workspace_idx;
+                    let workspace_id = monitors[monitor_idx].workspaces[workspace_idx].id();
+                    (monitor_idx, workspace_id)
+                });
+
+                let removed = minimized.removed;
+                monitors[target.0].add_restored_tile(
+                    target.1,
+                    removed.tile,
+                    &minimized.restore_anchor,
+                    removed.width,
+                    removed.is_full_width,
+                    removed.is_floating,
+                );
+                *active_monitor_idx = target.0;
+            }
+            MonitorSet::NoOutputs { workspaces } => {
+                if workspaces.is_empty() {
+                    workspaces.push(Workspace::new_no_outputs(
+                        self.clock.clone(),
+                        self.options.clone(),
+                    ));
+                }
+
+                let workspace_idx = workspaces
+                    .iter()
+                    .position(|workspace| workspace.id() == minimized.workspace_id)
+                    .unwrap_or(0);
+                let removed = minimized.removed;
+                workspaces[workspace_idx].add_restored_tile(
+                    removed.tile,
+                    &minimized.restore_anchor,
+                    removed.width,
+                    removed.is_full_width,
+                    removed.is_floating,
+                );
+            }
+        }
+    }
+
     pub fn descendants_added(&mut self, id: &W::Id) -> bool {
         for ws in self.workspaces_mut() {
             if ws.descendants_added(id) {
@@ -1225,6 +1631,18 @@ impl<W: LayoutElement> Layout<W> {
                 move_.tile.update_window();
                 return;
             }
+        }
+
+        if let Some(minimized) = self
+            .minimized
+            .iter_mut()
+            .find(|minimized| minimized.removed.tile.window().id() == window)
+        {
+            if let Some(serial) = serial {
+                minimized.removed.tile.window_mut().on_commit(serial);
+            }
+            minimized.removed.tile.update_window();
+            return;
         }
 
         match &mut self.monitor_set {
@@ -1369,6 +1787,14 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        if let Some(minimized) = self
+            .minimized
+            .iter()
+            .find(|minimized| minimized.removed.tile.window().is_wl_surface(wl_surface))
+        {
+            return Some((minimized.removed.tile.window(), None));
+        }
+
         match &self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
@@ -1399,6 +1825,14 @@ impl<W: LayoutElement> Layout<W> {
             if move_.tile.window().is_wl_surface(wl_surface) {
                 return Some((move_.tile.window_mut(), Some(&move_.output)));
             }
+        }
+
+        if let Some(idx) = self
+            .minimized
+            .iter()
+            .position(|minimized| minimized.removed.tile.window().is_wl_surface(wl_surface))
+        {
+            return Some((self.minimized[idx].removed.tile.window_mut(), None));
         }
 
         match &mut self.monitor_set {
@@ -2446,6 +2880,32 @@ impl<W: LayoutElement> Layout<W> {
 
         let mut seen_workspace_id = HashSet::new();
         let mut seen_workspace_name = Vec::<String>::new();
+
+        for (idx, minimized) in self.minimized.iter().enumerate() {
+            let tile = &minimized.removed.tile;
+            tile.verify_invariants();
+            assert!(
+                !self.has_window(tile.window().id()),
+                "minimized window must not remain in the visible layout"
+            );
+            assert!(
+                self.minimized[idx + 1..]
+                    .iter()
+                    .all(|other| other.removed.tile.window().id() != tile.window().id()),
+                "minimized window id must be unique"
+            );
+            assert_eq!(
+                self.minimized
+                    .iter()
+                    .filter(|other| {
+                        other.group_leader == minimized.group_leader
+                            && other.removed.tile.window().id() == &minimized.group_leader
+                    })
+                    .count(),
+                1,
+                "every minimized family must have exactly one retained leader"
+            );
+        }
 
         let (monitors, &primary_idx, &active_monitor_idx) = match &self.monitor_set {
             MonitorSet::Normal {
@@ -4637,6 +5097,17 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn start_open_animation_for_window(&mut self, window: &W::Id) {
+        self.start_open_animation_for_window_from(window, None);
+    }
+
+    /// Starts the open animation, optionally growing the window out of `travel_from`.
+    ///
+    /// `travel_from` is workspace-local, as produced by [`Self::resolve_window_transition`].
+    pub fn start_open_animation_for_window_from(
+        &mut self,
+        window: &W::Id,
+        travel_from: Option<Rectangle<f64, Logical>>,
+    ) {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == window {
                 return;
@@ -4644,7 +5115,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         for ws in self.workspaces_mut() {
-            if ws.start_open_animation(window) {
+            if ws.start_open_animation(window, travel_from) {
                 return;
             }
         }
@@ -4749,6 +5220,7 @@ impl<W: LayoutElement> Layout<W> {
         &mut self,
         renderer: &mut GlesRenderer,
         window: &W::Id,
+        travel_to: Option<Rectangle<f64, Logical>>,
         blocker: TransactionBlocker,
     ) {
         let _span = tracy_client::span!("Layout::start_close_animation_for_window");
@@ -4779,7 +5251,9 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
 
                 let tile_pos = tile_pos - ws_geo.loc;
-                ws.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+                ws.start_close_animation_for_tile(
+                    renderer, snapshot, tile_size, tile_pos, travel_to, blocker,
+                );
                 return;
             }
         }
@@ -4789,7 +5263,9 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
-                            ws.start_close_animation_for_window(renderer, window, blocker);
+                            ws.start_close_animation_for_window(
+                                renderer, window, travel_to, blocker,
+                            );
                             return;
                         }
                     }
@@ -4798,7 +5274,7 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
                     if ws.has_window(window) {
-                        ws.start_close_animation_for_window(renderer, window, blocker);
+                        ws.start_close_animation_for_window(renderer, window, travel_to, blocker);
                         return;
                     }
                 }
@@ -4872,6 +5348,22 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
                 !ws.is_floating(window_id)
             });
+        }
+
+        for minimized in &mut self.minimized {
+            let win = minimized.removed.tile.window_mut();
+            win.set_active_in_column(false);
+            win.set_floating(minimized.removed.is_floating);
+            win.set_activated(false);
+            win.set_interactive_resize(None);
+
+            if matches!(
+                win.configure_intent(),
+                ConfigureIntent::CanSend | ConfigureIntent::ShouldSend
+            ) {
+                win.send_pending_configure();
+            }
+            win.refresh();
         }
 
         match &mut self.monitor_set {
@@ -4994,6 +5486,103 @@ impl<W: LayoutElement> Layout<W> {
             .flat_map(|(mon, _, ws)| ws.windows().map(move |win| (mon, win)));
 
         moving_window.chain(rest)
+    }
+
+    /// Resolves an action-scoped transition hint against current layout state.
+    ///
+    /// The hint is resolved here, at handling time, rather than stored anywhere: an output can be
+    /// reconfigured or unplugged between a shell publishing a bubble rectangle and this
+    /// compositor acting on it. An unusable hint returns [`ResolvedTransition::Generic`], which
+    /// is an ordinary outcome and never blocks the lifecycle change.
+    pub fn resolve_window_transition(
+        &self,
+        window: &W::Id,
+        transition: Option<&WindowTransition>,
+    ) -> ResolvedTransition {
+        // Cheap paths first, so a plain bind or a reduced-motion request never walks the layout.
+        match transition {
+            None => return ResolvedTransition::Generic,
+            Some(WindowTransition::Disabled) => return ResolvedTransition::Disabled,
+            Some(WindowTransition::Anchored { .. }) => (),
+        }
+
+        let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
+            // Without outputs there is no coordinate space to travel through.
+            return ResolvedTransition::Generic;
+        };
+
+        let Some(monitor) = monitors.iter().find(|monitor| monitor.has_window(window)) else {
+            return ResolvedTransition::Generic;
+        };
+
+        let Some(workspace_geo) = monitor
+            .workspaces_with_render_geo_idx()
+            .find(|((_, ws), _)| ws.has_window(window))
+            .map(|(_, geo)| geo)
+        else {
+            return ResolvedTransition::Generic;
+        };
+
+        window_transition::resolve(
+            transition,
+            window_transition::OutputContext {
+                window_output: monitor.output_name(),
+                output_size: monitor.view_size(),
+                workspace_geo,
+            },
+        )
+    }
+
+    /// Public roots of mapped families held outside visible workspaces.
+    pub fn minimized_windows(&self) -> impl Iterator<Item = &W> {
+        self.minimized
+            .iter()
+            .filter(|minimized| minimized.removed.tile.window().id() == &minimized.group_leader)
+            .map(|minimized| minimized.removed.tile.window())
+    }
+
+    pub fn is_minimized(&self, window: &W::Id) -> bool {
+        self.minimized
+            .iter()
+            .any(|minimized| minimized.removed.tile.window().id() == window)
+    }
+
+    /// Every retained member of the minimized family containing `window`.
+    /// The argument may identify the public root or any of its descendants.
+    pub fn minimized_group_windows(&self, window: &W::Id) -> impl Iterator<Item = &W> {
+        let group_leader = self
+            .minimized
+            .iter()
+            .find(|minimized| minimized.removed.tile.window().id() == window)
+            .map(|minimized| minimized.group_leader.clone());
+        self.minimized
+            .iter()
+            .filter(move |minimized| {
+                group_leader
+                    .as_ref()
+                    .is_some_and(|leader| &minimized.group_leader == leader)
+            })
+            .map(|minimized| minimized.removed.tile.window())
+    }
+
+    /// Every minimized mapped window, including non-public transient descendants.
+    pub fn minimized_windows_with_descendants(&self) -> impl Iterator<Item = &W> {
+        self.minimized
+            .iter()
+            .map(|minimized| minimized.removed.tile.window())
+    }
+
+    /// Public family root for one minimized root or descendant.
+    pub fn minimized_group_leader(&self, window: &W::Id) -> Option<&W> {
+        let group_leader = &self
+            .minimized
+            .iter()
+            .find(|minimized| minimized.removed.tile.window().id() == window)?
+            .group_leader;
+        self.minimized
+            .iter()
+            .find(|minimized| minimized.removed.tile.window().id() == group_leader)
+            .map(|minimized| minimized.removed.tile.window())
     }
 
     pub fn has_window(&self, window: &W::Id) -> bool {

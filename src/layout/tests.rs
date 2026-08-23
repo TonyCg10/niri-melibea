@@ -3732,6 +3732,521 @@ fn workspace_render_geo_at_fractional_scale() {
     );
 }
 
+#[test]
+fn minimized_window_is_absent_from_visible_layout_and_restores() {
+    let mut layout = check_ops([
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    assert!(layout.minimize_window(&1));
+    layout.verify_invariants();
+    assert!(!layout.has_window(&1));
+    assert_eq!(
+        layout
+            .windows()
+            .map(|(_, win)| *win.id())
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert!(!layout.minimize_window(&1));
+
+    assert!(layout.restore_window(&1));
+    layout.verify_invariants();
+    assert!(layout.has_window(&1));
+    assert!(!layout.is_minimized(&1));
+    assert!(!layout.restore_window(&1));
+}
+
+#[test]
+fn minimizing_transient_child_holds_one_root_family() {
+    let mut child = TestWindowParams::new(2);
+    child.parent_id = Some(1);
+    let mut grandchild = TestWindowParams::new(3);
+    grandchild.parent_id = Some(2);
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow { params: child },
+        Op::AddWindow { params: grandchild },
+    ]);
+
+    assert_eq!(layout.minimization_family(&2), vec![1, 2, 3]);
+    assert!(layout.minimize_window(&2));
+    layout.verify_invariants();
+    assert!(layout.windows().next().is_none());
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        layout
+            .minimized_group_windows(&2)
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+
+    assert!(layout.restore_window(&1));
+    layout.verify_invariants();
+    assert_eq!(layout.windows().count(), 3);
+    assert!(layout.minimized_windows().next().is_none());
+}
+
+#[test]
+fn new_transient_joins_minimized_parent_family() {
+    let mut layout = check_ops([Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }]);
+    assert!(layout.minimize_window(&1));
+
+    let mut child = TestWindowParams::new(2);
+    child.parent_id = Some(1);
+    layout.add_window(
+        TestWindow::new(child),
+        AddWindowTarget::Auto,
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::No,
+    );
+    assert!(layout.minimize_window_with_parent(&2, &1));
+    layout.verify_invariants();
+
+    assert!(layout.windows().next().is_none());
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        layout
+            .minimized_group_windows(&1)
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn closing_minimized_family_root_promotes_descendant() {
+    let mut child = TestWindowParams::new(2);
+    child.parent_id = Some(1);
+    let mut layout = check_ops([
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow { params: child },
+    ]);
+    assert!(layout.minimize_window(&1));
+
+    assert!(layout.remove_window(&1, Transaction::new()).is_some());
+    layout.verify_invariants();
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert!(layout.restore_window(&2));
+    assert!(layout.has_window(&2));
+}
+
+#[test]
+fn closing_minimized_descendant_keeps_family_root() {
+    let mut child = TestWindowParams::new(2);
+    child.parent_id = Some(1);
+    let mut layout = check_ops([
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow { params: child },
+    ]);
+    assert!(layout.minimize_window(&1));
+
+    assert!(layout.remove_window(&2, Transaction::new()).is_some());
+    layout.verify_invariants();
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(layout.minimized_group_windows(&1).count(), 1);
+}
+
+#[test]
+fn minimized_transient_reparenting_splits_and_merges_families() {
+    let mut child = TestWindowParams::new(2);
+    child.parent_id = Some(1);
+    let mut grandchild = TestWindowParams::new(3);
+    grandchild.parent_id = Some(2);
+    let mut layout = check_ops([
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow { params: child },
+        Op::AddWindow { params: grandchild },
+    ]);
+    assert!(layout.minimize_window(&1));
+
+    layout
+        .minimized_group_windows(&1)
+        .find(|window| window.id() == &2)
+        .unwrap()
+        .0
+        .parent_id
+        .set(None);
+    assert!(layout.reconcile_minimized_parent(&2, None));
+    layout.verify_invariants();
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        layout
+            .minimized_group_windows(&2)
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+
+    layout
+        .minimized_group_windows(&2)
+        .find(|window| window.id() == &2)
+        .unwrap()
+        .0
+        .parent_id
+        .set(Some(1));
+    assert!(layout.reconcile_minimized_parent(&2, Some(&1)));
+    layout.verify_invariants();
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(layout.minimized_group_windows(&1).count(), 3);
+}
+
+#[test]
+fn restore_reinserts_tiled_window_between_surviving_neighbors() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::FocusWindow(2),
+    ]);
+
+    assert_eq!(scrolling_position(&layout, 2), Some((2, 1)));
+    assert!(layout.minimize_window(&2));
+    check_ops_on_layout(&mut layout, [Op::FocusWindow(3)]);
+    assert!(layout.restore_window(&2));
+    layout.verify_invariants();
+
+    assert_eq!(scrolling_position(&layout, 1), Some((1, 1)));
+    assert_eq!(scrolling_position(&layout, 2), Some((2, 1)));
+    assert_eq!(scrolling_position(&layout, 3), Some((3, 1)));
+}
+
+#[test]
+fn restore_uses_closest_surviving_original_column_neighbor() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(4),
+        },
+        Op::FocusWindow(2),
+    ]);
+
+    assert!(layout.minimize_window(&2));
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::CloseWindow(1),
+            Op::CloseWindow(3),
+            Op::AddWindow {
+                params: TestWindowParams::new(5),
+            },
+        ],
+    );
+    assert!(layout.restore_window(&2));
+    layout.verify_invariants();
+
+    assert_eq!(scrolling_position(&layout, 2), Some((1, 1)));
+    assert_eq!(scrolling_position(&layout, 4), Some((2, 1)));
+    assert_eq!(scrolling_position(&layout, 5), Some((3, 1)));
+}
+
+#[test]
+fn restore_reinserts_tiled_window_at_original_position_in_column() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: None },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: None },
+    ]);
+
+    let original = scrolling_position(&layout, 2).unwrap();
+    assert!(layout.minimize_window(&2));
+    assert!(layout.restore_window(&2));
+    layout.verify_invariants();
+    assert_eq!(scrolling_position(&layout, 2), Some(original));
+}
+
+#[test]
+fn restore_preserves_floating_stack_relation() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::ToggleWindowFloating { id: None },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ToggleWindowFloating { id: None },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ToggleWindowFloating { id: None },
+    ]);
+
+    let original = floating_stack(&layout);
+    assert_eq!(original, vec![3, 2, 1]);
+    assert!(layout.minimize_window(&2));
+    assert!(layout.restore_window(&2));
+    layout.verify_invariants();
+    assert_eq!(floating_stack(&layout), original);
+}
+
+fn scrolling_position(layout: &Layout<TestWindow>, id: usize) -> Option<(usize, usize)> {
+    layout.workspaces().find_map(|(_, _, workspace)| {
+        workspace
+            .tiles_with_ipc_layouts()
+            .find(|(tile, _)| tile.window().id() == &id)
+            .and_then(|(_, layout)| layout.pos_in_scrolling_layout)
+    })
+}
+
+fn floating_stack(layout: &Layout<TestWindow>) -> Vec<usize> {
+    layout
+        .workspaces()
+        .flat_map(|(_, _, workspace)| workspace.tiles_with_ipc_layouts())
+        .filter_map(|(tile, layout)| {
+            layout
+                .pos_in_scrolling_layout
+                .is_none()
+                .then(|| *tile.window().id())
+        })
+        .collect()
+}
+
+#[test]
+fn multiple_minimized_windows_keep_order_and_restore_independently() {
+    let mut layout = check_ops([
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+    ]);
+
+    assert!(layout.minimize_window(&1));
+    assert!(layout.minimize_window(&3));
+    layout.verify_invariants();
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+
+    assert!(layout.restore_window(&1));
+    layout.verify_invariants();
+    assert!(layout.has_window(&1));
+    assert!(layout.has_window(&2));
+    assert!(!layout.has_window(&3));
+    assert_eq!(
+        layout
+            .minimized_windows()
+            .map(|window| *window.id())
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+
+    assert!(layout.remove_window(&3, Transaction::new()).is_some());
+    layout.verify_invariants();
+    assert!(layout.minimized_windows().next().is_none());
+}
+
+#[test]
+fn restore_falls_back_when_dynamic_workspace_was_removed() {
+    let mut layout = check_ops([Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }]);
+
+    assert!(layout.minimize_window(&1));
+    layout.verify_invariants();
+    assert!(layout.workspaces().next().is_none());
+
+    assert!(layout.restore_window(&1));
+    layout.verify_invariants();
+    assert!(layout.has_window(&1));
+    assert_eq!(layout.workspaces().count(), 1);
+}
+
+#[test]
+fn restore_returns_to_original_output_when_it_still_exists() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::FocusOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::FocusOutput(1),
+    ]);
+
+    assert!(layout.minimize_window(&1));
+    assert!(layout.restore_window(&1));
+    layout.verify_invariants();
+
+    let (monitor, _) = layout
+        .windows()
+        .find(|(_, window)| window.id() == &1)
+        .unwrap();
+    assert_eq!(monitor.unwrap().output_name(), "output2");
+}
+
+#[test]
+fn restore_falls_back_to_active_output_when_original_output_was_removed() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::FocusOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddOutput(3),
+    ]);
+
+    assert!(layout.minimize_window(&1));
+    check_ops_on_layout(&mut layout, [Op::FocusOutput(3), Op::RemoveOutput(2)]);
+    assert!(layout.restore_window(&1));
+    layout.verify_invariants();
+
+    let (monitor, _) = layout
+        .windows()
+        .find(|(_, window)| window.id() == &1)
+        .unwrap();
+    assert_eq!(monitor.unwrap().output_name(), "output3");
+}
+
+#[test]
+fn minimize_restore_preserves_fullscreen_state() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::FullscreenWindow(1),
+        Op::Communicate(1),
+    ]);
+
+    assert!(layout
+        .windows()
+        .find(|(_, window)| window.id() == &1)
+        .unwrap()
+        .1
+        .pending_sizing_mode()
+        .is_fullscreen());
+    assert!(layout.minimize_window(&1));
+    assert!(layout
+        .minimized_windows()
+        .find(|window| window.id() == &1)
+        .unwrap()
+        .pending_sizing_mode()
+        .is_fullscreen());
+
+    assert!(layout.restore_window(&1));
+    layout.verify_invariants();
+    assert!(layout
+        .windows()
+        .find(|(_, window)| window.id() == &1)
+        .unwrap()
+        .1
+        .pending_sizing_mode()
+        .is_fullscreen());
+}
+
+#[test]
+fn client_close_removes_minimized_state() {
+    let mut layout = check_ops([Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }]);
+
+    assert!(layout.minimize_window(&1));
+    assert!(layout.remove_window(&1, Transaction::new()).is_some());
+    layout.verify_invariants();
+    assert!(!layout.is_minimized(&1));
+    assert!(layout.windows().next().is_none());
+}
+
 fn parent_id_causes_loop(layout: &Layout<TestWindow>, id: usize, mut parent_id: usize) -> bool {
     if parent_id == id {
         return true;
@@ -3927,5 +4442,141 @@ proptest! {
         };
 
         check_ops_with_options(options, ops);
+    }
+}
+
+fn test_anchor(output: &str) -> niri_ipc::BubbleAnchor {
+    niri_ipc::BubbleAnchor {
+        output: String::from(output),
+        x: 1250.,
+        y: 8.,
+        width: 22.,
+        height: 22.,
+    }
+}
+
+#[test]
+fn an_omitted_transition_leaves_minimization_on_generic_motion() {
+    let layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ]);
+
+    assert_eq!(
+        layout.resolve_window_transition(&1, None),
+        ResolvedTransition::Generic
+    );
+}
+
+#[test]
+fn a_disabled_transition_resolves_without_consulting_the_layout() {
+    // Reduced motion must work even for a window the layout cannot locate, because it describes
+    // the absence of animation rather than a trajectory through any coordinate space.
+    let layout = check_ops([Op::AddOutput(1)]);
+
+    assert_eq!(
+        layout.resolve_window_transition(&404, Some(&WindowTransition::Disabled)),
+        ResolvedTransition::Disabled
+    );
+}
+
+#[test]
+fn an_anchor_on_the_window_output_resolves_to_workspace_local_coordinates() {
+    let layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ]);
+
+    let transition = WindowTransition::Anchored {
+        anchor: test_anchor("output1"),
+    };
+    let resolved = layout.resolve_window_transition(&1, Some(&transition));
+
+    let Some(rect) = resolved.anchor() else {
+        panic!("a usable same-output anchor must resolve, got {resolved:?}");
+    };
+    assert_eq!(rect.size, Size::from((22., 22.)));
+    // The single workspace on a fresh output renders at its origin, so the rectangle survives
+    // unchanged. `a_workspace_offset_is_subtracted_from_the_anchor` covers the shifted case.
+    assert_eq!(rect.loc, Point::from((1250., 8.)));
+}
+
+#[test]
+fn an_anchor_on_another_output_degrades_to_generic_motion() {
+    // Cross-output travel is explicitly out of scope: the trajectory would have to cross an
+    // unspecified topology, so it degrades rather than guessing.
+    let layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::FocusOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ]);
+
+    let transition = WindowTransition::Anchored {
+        anchor: test_anchor("output1"),
+    };
+    assert_eq!(
+        layout.resolve_window_transition(&1, Some(&transition)),
+        ResolvedTransition::Generic
+    );
+}
+
+#[test]
+fn an_anchor_for_an_unknown_window_degrades_to_generic_motion() {
+    let layout = check_ops([Op::AddOutput(1)]);
+
+    let transition = WindowTransition::Anchored {
+        anchor: test_anchor("output1"),
+    };
+    assert_eq!(
+        layout.resolve_window_transition(&404, Some(&transition)),
+        ResolvedTransition::Generic
+    );
+}
+
+#[test]
+fn a_transition_never_changes_authoritative_minimized_state() {
+    // The whole M7 contract rests on this: presentation is decorative, and every hint must reach
+    // exactly the same authoritative state as no hint at all.
+    for transition in [
+        None,
+        Some(WindowTransition::Disabled),
+        Some(WindowTransition::Anchored {
+            anchor: test_anchor("output1"),
+        }),
+        // An anchor that cannot resolve must not block the lifecycle change either.
+        Some(WindowTransition::Anchored {
+            anchor: niri_ipc::BubbleAnchor {
+                output: String::from("gone"),
+                ..test_anchor("output1")
+            },
+        }),
+    ] {
+        let mut layout = check_ops([
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+        ]);
+
+        // Resolution is read-only; it must not disturb the layout it inspects.
+        let _ = layout.resolve_window_transition(&1, transition.as_ref());
+        layout.verify_invariants();
+
+        assert!(layout.minimize_window(&1), "minimize must apply");
+        assert!(layout.is_minimized(&1));
+        assert!(layout.windows().all(|(_, window)| window.id() != &1));
+        layout.verify_invariants();
+
+        assert!(layout.restore_window(&1), "restore must apply");
+        assert!(!layout.is_minimized(&1));
+        assert!(layout.windows().any(|(_, window)| window.id() == &1));
+        layout.verify_invariants();
     }
 }

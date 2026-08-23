@@ -1449,6 +1449,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         &mut self,
         renderer: &mut GlesRenderer,
         window: &W::Id,
+        travel_to: Option<Rectangle<f64, Logical>>,
         blocker: TransactionBlocker,
     ) {
         let (tile, mut tile_pos) = self
@@ -1503,7 +1504,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             tile_pos.x -= offset;
         }
 
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.start_close_animation_for_tile(
+            renderer, snapshot, tile_size, tile_pos, travel_to, blocker,
+        );
     }
 
     fn start_close_animation_for_tile(
@@ -1512,6 +1515,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
+        travel_to: Option<Rectangle<f64, Logical>>,
         blocker: TransactionBlocker,
     ) {
         let anim = Animation::new(
@@ -1530,7 +1534,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let scale = Scale::from(self.scale);
         let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
+            renderer, snapshot, scale, tile_size, tile_pos, travel_to, blocker, anim,
         );
         match res {
             Ok(closing) => {
@@ -1542,10 +1546,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
-    pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
+    pub fn start_open_animation(
+        &mut self,
+        id: &W::Id,
+        travel_from: Option<Rectangle<f64, Logical>>,
+    ) -> bool {
         self.columns
             .iter_mut()
-            .any(|col| col.start_open_animation(id))
+            .any(|col| col.start_open_animation(id, travel_from))
     }
 
     pub fn focus_left(&mut self) -> bool {
@@ -5327,10 +5335,14 @@ impl<W: LayoutElement> Column<W> {
         Rectangle::new(self.tiles_origin(), area_size)
     }
 
-    pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
+    pub fn start_open_animation(
+        &mut self,
+        id: &W::Id,
+        travel_from: Option<Rectangle<f64, Logical>>,
+    ) -> bool {
         for tile in &mut self.tiles {
             if tile.window().id() == id {
-                tile.start_open_animation();
+                tile.start_open_animation_from(travel_from);
 
                 // Animate the appearance of the tab indicator.
                 if self.display_mode == ColumnDisplay::Tabbed

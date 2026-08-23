@@ -73,6 +73,8 @@ pub enum Request {
     Workspaces,
     /// Request information about open windows.
     Windows,
+    /// Request information about windows held outside visible workspaces.
+    MinimizedWindows,
     /// Request information about layer-shell surfaces.
     Layers,
     /// Request information about the configured keyboard layouts.
@@ -147,6 +149,10 @@ pub enum Response {
     Workspaces(Vec<Workspace>),
     /// Information about open windows.
     Windows(Vec<Window>),
+    /// Information about windows held outside visible workspaces.
+    MinimizedWindows(Vec<MinimizedWindow>),
+    /// Semantic result of a targeted minimize, restore, or close action.
+    WindowActionResult(WindowActionResult),
     /// Information about layer-shell surfaces.
     Layers(Vec<LayerSurface>),
     /// Information about the keyboard layout.
@@ -293,6 +299,35 @@ pub enum Action {
         /// If `None`, uses the focused window.
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
+    },
+    /// Experimentally minimize a window outside visible workspaces.
+    #[cfg_attr(feature = "clap", clap(about = "Minimize the focused window"))]
+    MinimizeWindow {
+        /// Id of the window to minimize.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Optional presentation hint scoped to this minimize action only.
+        ///
+        /// Omitting it requests the ordinary compositor-local transition. The hint never
+        /// affects, delays, or owns authoritative minimized state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "clap", arg(skip))]
+        transition: Option<WindowTransition>,
+    },
+    /// Experimentally restore a natively minimized window by id.
+    RestoreWindow {
+        /// Id of the minimized window to restore.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: u64,
+        /// Optional presentation hint scoped to this restore action only.
+        ///
+        /// Omitting it requests the ordinary compositor-local transition. The hint never
+        /// affects, delays, or owns authoritative minimized state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "clap", arg(skip))]
+        transition: Option<WindowTransition>,
     },
     /// Toggle fullscreen on a window.
     #[cfg_attr(
@@ -1336,6 +1371,119 @@ pub struct Window {
     pub focus_timestamp: Option<Timestamp>,
 }
 
+/// A toplevel window held outside visible workspaces.
+///
+/// Minimized windows remain mapped and owned by the compositor, but have no visible workspace or
+/// layout geometry. This deliberately uses a separate type from [`Window`] so IPC consumers do not
+/// need to infer minimization from fake workspace or geometry values.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct MinimizedWindow {
+    /// Unique id of this window.
+    pub id: u64,
+    /// Title, if set.
+    pub title: Option<String>,
+    /// Application ID, if set.
+    pub app_id: Option<String>,
+    /// Process ID that created the Wayland connection for this window, if known.
+    pub pid: Option<i32>,
+    /// Whether this window requests your attention.
+    pub is_urgent: bool,
+    /// Timestamp when the window was most recently focused.
+    pub focus_timestamp: Option<Timestamp>,
+}
+
+/// Semantic result of an action whose effect depends on one window's lifecycle state.
+///
+/// Unlike [`Response::Handled`], this response distinguishes an applied transition from a
+/// missing target, an already-satisfied request, a blocked transition, and a close request whose
+/// final completion still depends on the client destroying its surface.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowActionResult {
+    /// Window id requested by the caller, or `None` for a focused-window request.
+    pub requested_id: Option<u64>,
+    /// Resolved authoritative id. After minimizing a transient descendant, this is the public
+    /// family-root id exposed by [`Request::MinimizedWindows`].
+    pub window_id: Option<u64>,
+    /// Semantic outcome observed after handling the request.
+    pub status: WindowActionStatus,
+}
+
+/// How a minimize or restore action should be presented.
+///
+/// A transition is an ephemeral, action-scoped presentation hint. It is never stored, never
+/// becomes a second state authority, and never delays the authoritative lifecycle change. An
+/// unusable hint deterministically degrades to the ordinary compositor-local transition.
+///
+/// The wire form is internally tagged and lowercase so it matches the shell-facing contract
+/// Melibea already froze, rather than forcing a translation step between two spellings of the
+/// same hint.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum WindowTransition {
+    /// Travel between the window geometry and a shell-owned anchor rectangle.
+    Anchored {
+        /// Destination of a minimize, and origin of a restore.
+        anchor: BubbleAnchor,
+    },
+    /// Change state without spatial, scale, or opacity animation.
+    Disabled,
+}
+
+/// An output-local logical rectangle owned by the shell that draws it.
+///
+/// The shell owns this rectangle because it draws the bubble. The compositor retains output
+/// topology, transforms, scale, clipping, and conversion into its own render spaces.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct BubbleAnchor {
+    /// Name of the output whose logical coordinate space this rectangle uses.
+    pub output: String,
+    /// Output-local logical x coordinate of the rectangle origin.
+    pub x: f64,
+    /// Output-local logical y coordinate of the rectangle origin.
+    pub y: f64,
+    /// Logical width of the rectangle.
+    pub width: f64,
+    /// Logical height of the rectangle.
+    pub height: f64,
+}
+
+impl BubbleAnchor {
+    /// Whether this rectangle is representable independently of compositor state.
+    ///
+    /// This checks only self-contained geometry. Output identity and output bounds are resolved
+    /// later against live compositor state, because both can change between a shell's action and
+    /// the compositor handling it.
+    pub fn is_well_formed(&self) -> bool {
+        !self.output.is_empty()
+            && self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.width > 0.
+            && self.height > 0.
+    }
+}
+
+/// Outcome of a targeted window lifecycle action.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum WindowActionStatus {
+    /// The requested minimize or restore transition occurred.
+    Applied,
+    /// The target was already in the requested visible or minimized state.
+    AlreadyInRequestedState,
+    /// A close request was sent. Completion is observed through the resulting state event.
+    CloseRequested,
+    /// No eligible window matched the request.
+    WindowNotFound,
+    /// The target existed, but current compositor state prevented the transition.
+    Blocked,
+}
+
 /// A moment in time.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -1611,6 +1759,13 @@ pub enum Event {
         /// This configuration completely replaces the previous configuration. I.e. if any windows
         /// are missing from here, then they were closed.
         windows: Vec<Window>,
+    },
+    /// The minimized window configuration has changed.
+    MinimizedWindowsChanged {
+        /// The complete ordered set of windows held outside visible workspaces.
+        ///
+        /// This configuration completely replaces the previous configuration.
+        windows: Vec<MinimizedWindow>,
     },
     /// A new toplevel window was opened, or an existing toplevel window changed.
     WindowOpenedOrChanged {
@@ -2044,6 +2199,165 @@ impl OutputAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_minimization_actions_keep_their_exact_wire_form() {
+        // An action without a transition must serialize exactly as it did before protocol v2
+        // existed, so every existing client keeps working untouched.
+        let minimize = Action::MinimizeWindow {
+            id: Some(42),
+            transition: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&minimize).unwrap(),
+            r#"{"MinimizeWindow":{"id":42}}"#
+        );
+
+        let restore = Action::RestoreWindow {
+            id: 42,
+            transition: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&restore).unwrap(),
+            r#"{"RestoreWindow":{"id":42}}"#
+        );
+    }
+
+    #[test]
+    fn legacy_minimization_actions_still_deserialize_without_a_transition() {
+        // `Action` does not implement `PartialEq` upstream, so round trips are compared through
+        // their wire form rather than by widening an upstream type for tests.
+        let minimize: Action = serde_json::from_str(r#"{"MinimizeWindow":{"id":null}}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&minimize).unwrap(),
+            r#"{"MinimizeWindow":{"id":null}}"#
+        );
+
+        let restore: Action = serde_json::from_str(r#"{"RestoreWindow":{"id":7}}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&restore).unwrap(),
+            r#"{"RestoreWindow":{"id":7}}"#
+        );
+    }
+
+    #[test]
+    fn minimization_actions_round_trip_both_transitions() {
+        let anchored = Action::MinimizeWindow {
+            id: None,
+            transition: Some(WindowTransition::Anchored {
+                anchor: BubbleAnchor {
+                    output: String::from("DP-1"),
+                    x: 1874.,
+                    y: 9.,
+                    width: 22.,
+                    height: 22.,
+                },
+            }),
+        };
+        let encoded = serde_json::to_string(&anchored).unwrap();
+        // This exact spelling is what Melibea sends; it must not drift.
+        assert_eq!(
+            encoded,
+            r#"{"MinimizeWindow":{"id":null,"transition":{"type":"anchored","anchor":{"output":"DP-1","x":1874.0,"y":9.0,"width":22.0,"height":22.0}}}}"#
+        );
+        let decoded: Action = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        let Action::MinimizeWindow {
+            transition: Some(WindowTransition::Anchored { anchor }),
+            ..
+        } = decoded
+        else {
+            panic!("anchored minimize did not survive the round trip");
+        };
+        assert_eq!(anchor.output, "DP-1");
+        assert_eq!(anchor.width, 22.);
+
+        let disabled = Action::RestoreWindow {
+            id: 42,
+            transition: Some(WindowTransition::Disabled),
+        };
+        let encoded = serde_json::to_string(&disabled).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"RestoreWindow":{"id":42,"transition":{"type":"disabled"}}}"#
+        );
+        let decoded: Action = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            Action::RestoreWindow {
+                id: 42,
+                transition: Some(WindowTransition::Disabled)
+            }
+        ));
+    }
+
+    #[test]
+    fn well_formed_rejects_unusable_anchor_geometry() {
+        let usable = BubbleAnchor {
+            output: String::from("DP-1"),
+            x: 1874.,
+            y: 9.,
+            width: 22.,
+            height: 22.,
+        };
+        assert!(usable.is_well_formed());
+
+        // A negative origin is legitimate: the shell may anchor a bubble that is partially
+        // offscreen, and bounds are resolved later against live output state.
+        assert!(BubbleAnchor {
+            x: -4.,
+            y: -4.,
+            ..usable.clone()
+        }
+        .is_well_formed());
+
+        assert!(!BubbleAnchor {
+            output: String::new(),
+            ..usable.clone()
+        }
+        .is_well_formed());
+        assert!(!BubbleAnchor {
+            width: 0.,
+            ..usable.clone()
+        }
+        .is_well_formed());
+        assert!(!BubbleAnchor {
+            height: -1.,
+            ..usable.clone()
+        }
+        .is_well_formed());
+        assert!(!BubbleAnchor {
+            x: f64::NAN,
+            ..usable.clone()
+        }
+        .is_well_formed());
+        assert!(!BubbleAnchor {
+            width: f64::INFINITY,
+            ..usable
+        }
+        .is_well_formed());
+    }
+
+    #[test]
+    fn window_action_result_has_explicit_wire_status() {
+        let response = Response::WindowActionResult(WindowActionResult {
+            requested_id: Some(42),
+            window_id: Some(7),
+            status: WindowActionStatus::Applied,
+        });
+
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "WindowActionResult": {
+                    "requested_id": 42,
+                    "window_id": 7,
+                    "status": "Applied",
+                }
+            })
+        );
+    }
 
     #[test]
     fn parse_size_change() {

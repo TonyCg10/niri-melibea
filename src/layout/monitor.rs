@@ -17,7 +17,9 @@ use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
     WorkspaceRenderElement,
 };
-use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
+use super::{
+    compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options, RestoreAnchor,
+};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
@@ -593,6 +595,38 @@ impl<W: LayoutElement> Monitor<W> {
         if allow_to_activate_workspace && activate.map_smart(|| false) {
             self.activate_workspace(workspace_idx);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn add_restored_tile(
+        &mut self,
+        workspace_id: WorkspaceId,
+        tile: Tile<W>,
+        anchor: &RestoreAnchor<W::Id>,
+        width: ColumnWidth,
+        is_full_width: bool,
+        is_floating: bool,
+    ) {
+        let mut workspace_idx = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id() == workspace_id)
+            .unwrap();
+        let workspace = &mut self.workspaces[workspace_idx];
+        workspace.add_restored_tile(tile, anchor, width, is_full_width, is_floating);
+
+        if workspace.name().is_none() {
+            workspace.original_output = OutputId::new(&self.output);
+        }
+
+        if workspace_idx == self.workspaces.len() - 1 {
+            self.add_workspace_bottom();
+        }
+        if self.options.layout.empty_workspace_above_first && workspace_idx == 0 {
+            self.add_workspace_top();
+            workspace_idx += 1;
+        }
+        self.activate_workspace(workspace_idx);
     }
 
     pub fn add_tile_to_column(
