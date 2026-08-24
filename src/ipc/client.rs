@@ -528,6 +528,10 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                     Event::OverviewOpenedOrClosed { is_open: opened } => {
                         println!("Overview toggled: {opened}");
                     }
+                    Event::BindingModeChanged { mode } => match mode {
+                        Some(mode) => println!("Binding mode entered: {mode}"),
+                        None => println!("Binding mode left"),
+                    },
                     Event::ConfigLoaded { failed } => {
                         let status = if failed {
                             "with an error"

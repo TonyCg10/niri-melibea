@@ -3622,15 +3622,9 @@ impl<W: LayoutElement> Layout<W> {
                     for ws in self.workspaces_mut() {
                         ws.dnd_scroll_gesture_end();
                     }
-                } else {
-                    // Animate the tile back to semitransparent.
-                    move_.tile.animate_alpha(
-                        1.,
-                        INTERACTIVE_MOVE_ALPHA,
-                        self.options.animations.window_movement.0,
-                    );
-                    move_.tile.hold_alpha_animation_after_done();
                 }
+                // Toggling back to tiled stays opaque, matching the pick-up path: tiled
+                // windows never ghost to `INTERACTIVE_MOVE_ALPHA`.
 
                 return;
             }
@@ -4449,15 +4443,9 @@ impl<W: LayoutElement> Layout<W> {
                     for ws in self.workspaces_mut() {
                         ws.dnd_scroll_gesture_end();
                     }
-                } else {
-                    // Animate to semitransparent.
-                    tile.animate_alpha(
-                        1.,
-                        INTERACTIVE_MOVE_ALPHA,
-                        self.options.animations.window_movement.0,
-                    );
-                    tile.hold_alpha_animation_after_done();
                 }
+                // A tiled/column window being picked up stays fully opaque rather than
+                // ghosting to `INTERACTIVE_MOVE_ALPHA`. Floating windows above are unaffected.
 
                 let mut data = InteractiveMoveData {
                     tile,

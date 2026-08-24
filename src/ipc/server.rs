@@ -1012,6 +1012,24 @@ impl State {
         server.send_event(event);
     }
 
+    pub fn ipc_binding_mode_changed(&mut self) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        let mut state = server.event_stream_state.borrow_mut();
+        let state = &mut state.binding_mode;
+        let mode = self.niri.binding_mode.clone();
+
+        if state.mode == mode {
+            return;
+        }
+
+        let event = Event::BindingModeChanged { mode };
+        state.apply(event.clone());
+        server.send_event(event);
+    }
+
     pub fn ipc_refresh_overview(&mut self) {
         let Some(server) = &self.niri.ipc_server else {
             return;

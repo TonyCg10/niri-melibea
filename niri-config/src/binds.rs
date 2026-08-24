@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use bitflags::bitflags;
 use knuffel::errors::DecodeError;
+use knuffel::traits::DecodeScalar as _;
 use miette::miette;
 use niri_ipc::{
     ColumnDisplay, LayoutSwitchTarget, PositionChange, SizeChange, WorkspaceReferenceArg,
@@ -16,8 +17,63 @@ use smithay::input::keyboard::Keysym;
 use crate::recent_windows::{MruDirection, MruFilter, MruScope};
 use crate::utils::{expect_only_children, MergeWith};
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Binds(pub Vec<Bind>);
+
+/// A named set of binds that replaces the ordinary ones while it is active.
+///
+/// Modes exist because the plain keys are the scarce resource: once `Mod+Shift+Ctrl+Left`
+/// is taken, the next binding has nowhere comfortable left to go. Inside a mode a bare
+/// arrow can mean something specific, because the mode itself supplies the context that
+/// the modifiers were standing in for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingMode {
+    pub name: String,
+    pub binds: Binds,
+    /// Whether firing any of this mode's binds also leaves the mode.
+    ///
+    /// Off by default, matching i3 and Sway: a mode is somewhere you stay until you leave,
+    /// which is what "resize repeatedly" wants. Turn it on for a mode that asks one
+    /// question — pick a monitor, pick a workspace — and should get out of the way once
+    /// it has been answered.
+    pub exit_on_action: bool,
+}
+
+impl BindingMode {
+    /// The keysym that leaves any mode whether or not its configuration says so.
+    ///
+    /// A mode with no way out is a captured keyboard, and the only remedy left to the
+    /// person at it is a TTY. Escape is therefore not a default that configuration can
+    /// replace; it is a floor beneath it, applied in [`Self::escape_hatch`].
+    pub const ESCAPE: Keysym = Keysym::Escape;
+
+    /// Adds the implicit escape bind unless the mode already binds Escape itself.
+    ///
+    /// Done when the mode is parsed rather than when keys are looked up, so the way out is
+    /// part of the mode as configured: it can be inspected, tested, and listed like any
+    /// other bind. A mode that binds Escape to something deliberate keeps its own meaning.
+    fn add_escape_hatch(&mut self) {
+        let binds_escape = self.binds.0.iter().any(|bind| {
+            matches!(bind.key.trigger, Trigger::Keysym(key) if key == Self::ESCAPE)
+        });
+        if binds_escape {
+            return;
+        }
+
+        self.binds.0.push(Bind {
+            key: Key {
+                trigger: Trigger::Keysym(Self::ESCAPE),
+                modifiers: Modifiers::empty(),
+            },
+            action: Action::ExitBindingMode,
+            repeat: false,
+            cooldown: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+        });
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bind {
@@ -110,6 +166,10 @@ pub enum Action {
     DebugToggleOpaqueRegions,
     DebugToggleDamage,
     Spawn(#[knuffel(arguments)] Vec<String>),
+    /// Enter the named binding mode. Naming a mode that does not exist does nothing.
+    EnterBindingMode(#[knuffel(argument)] String),
+    /// Leave the current binding mode. Does nothing when no mode is active.
+    ExitBindingMode,
     SpawnSh(#[knuffel(argument)] String),
     DoScreenTransition(#[knuffel(property(name = "delay-ms"))] Option<u16>),
     #[knuffel(skip)]
@@ -794,6 +854,63 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for WorkspaceRefere
     }
 }
 
+impl<S> knuffel::Decode<S> for BindingMode
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let mut name = None;
+        for (idx, arg) in node.arguments.iter().enumerate() {
+            if idx == 0 {
+                name = Some(String::decode(arg, ctx)?);
+            } else {
+                ctx.emit_error(DecodeError::unexpected(
+                    &arg.literal,
+                    "argument",
+                    "a binding mode takes only its name",
+                ));
+            }
+        }
+        let Some(name) = name else {
+            return Err(DecodeError::missing(node, "binding mode requires a name"));
+        };
+
+        let mut exit_on_action = false;
+        for (name, value) in &node.properties {
+            if &***name == "exit-on-action" {
+                exit_on_action = bool::decode(value, ctx)?;
+            } else {
+                ctx.emit_error(DecodeError::unexpected(
+                    name,
+                    "property",
+                    format!("unexpected property `{}`", &***name),
+                ));
+            }
+        }
+
+        let mut binds = Vec::new();
+        if let Some(children) = &node.children {
+            for child in children.iter() {
+                match Bind::decode_node(child, ctx) {
+                    Err(e) => ctx.emit_error(e),
+                    Ok(bind) => binds.push(bind),
+                }
+            }
+        }
+
+        let mut mode = BindingMode {
+            name,
+            binds: Binds(binds),
+            exit_on_action,
+        };
+        mode.add_escape_hatch();
+        Ok(mode)
+    }
+}
+
 impl<S> knuffel::Decode<S> for Binds
 where
     S: knuffel::traits::ErrorSpan,
@@ -1076,6 +1193,78 @@ impl FromStr for Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_mode(text: &str) -> BindingMode {
+        let mut modes: Vec<BindingMode> = knuffel::parse("test.kdl", text).expect("parses");
+        assert_eq!(modes.len(), 1);
+        modes.remove(0)
+    }
+
+    #[test]
+    fn a_mode_without_its_own_escape_still_has_a_way_out() {
+        // A mode with no way out is a captured keyboard whose only remedy is a TTY, so the
+        // escape is a floor beneath the configuration rather than a default it can remove.
+        let mode = parse_mode(
+            r#"
+            binding-mode "monitor" {
+                Left { focus-monitor-left; }
+            }
+            "#,
+        );
+
+        let escape = mode
+            .binds
+            .0
+            .iter()
+            .find(|bind| bind.key.trigger == Trigger::Keysym(BindingMode::ESCAPE))
+            .expect("an unconfigured mode must still bind escape");
+        assert_eq!(escape.action, Action::ExitBindingMode);
+        assert_eq!(escape.key.modifiers, Modifiers::empty());
+    }
+
+    #[test]
+    fn a_mode_that_binds_escape_itself_keeps_its_own_meaning() {
+        // The hatch exists to prevent a trap, not to overrule a deliberate choice.
+        let mode = parse_mode(
+            r#"
+            binding-mode "monitor" {
+                Escape { close-window; }
+            }
+            "#,
+        );
+
+        let escapes: Vec<_> = mode
+            .binds
+            .0
+            .iter()
+            .filter(|bind| bind.key.trigger == Trigger::Keysym(BindingMode::ESCAPE))
+            .collect();
+        assert_eq!(escapes.len(), 1, "the hatch must not be added alongside it");
+        assert_eq!(escapes[0].action, Action::CloseWindow);
+    }
+
+    #[test]
+    fn a_mode_reads_its_name_and_its_exit_on_action_choice() {
+        let staying = parse_mode(
+            r#"
+            binding-mode "resize" {
+                Left { set-column-width "-10%"; }
+            }
+            "#,
+        );
+        assert_eq!(staying.name, "resize");
+        // Off by default, as in i3 and Sway: a mode is somewhere you stay until you leave.
+        assert!(!staying.exit_on_action);
+
+        let leaving = parse_mode(
+            r#"
+            binding-mode "monitor" exit-on-action=true {
+                Left { focus-monitor-left; }
+            }
+            "#,
+        );
+        assert!(leaving.exit_on_action);
+    }
 
     #[test]
     fn converts_experimental_minimization_actions_from_ipc() {

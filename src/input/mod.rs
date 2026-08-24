@@ -662,7 +662,12 @@ impl State {
                 let res = {
                     let config = this.niri.config.borrow();
                     let bindings =
-                        make_binds_iter(&config, &mut this.niri.window_mru_ui, modifiers);
+                        make_binds_iter(
+                            &config,
+                            &mut this.niri.window_mru_ui,
+                            modifiers,
+                            this.niri.binding_mode.as_deref(),
+                        );
 
                     should_intercept_key(
                         &mut this.niri.suppressed_keys,
@@ -798,7 +803,51 @@ impl State {
         }
     }
 
+    /// Enters, leaves, or switches binding mode, announcing the change.
+    ///
+    /// The announcement is the half that makes a mode usable: a shell draws the indicator
+    /// from it, so nobody has to remember which mode they are in or what it binds.
+    fn set_binding_mode(&mut self, mode: Option<String>) {
+        if self.niri.binding_mode == mode {
+            return;
+        }
+
+        self.niri.binding_mode = mode;
+        self.ipc_binding_mode_changed();
+    }
+
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
+        // A mode that answers one question — pick a monitor, pick a workspace — should get out
+        // of the way once it has been answered. Decided before the action runs, because the
+        // action may well be what changes the mode, and wrapped around it so that an action
+        // returning early still leaves the mode.
+        let leave_after = self
+            .niri
+            .binding_mode
+            .as_deref()
+            .filter(|_| {
+                // The mode actions own the mode themselves; exiting underneath them would
+                // undo an `enter-binding-mode` the moment it ran.
+                !matches!(
+                    action,
+                    Action::EnterBindingMode(_) | Action::ExitBindingMode
+                )
+            })
+            .and_then(|name| {
+                let config = self.niri.config.borrow();
+                let mode = config.binding_modes.iter().find(|mode| mode.name == name)?;
+                mode.exit_on_action.then_some(())
+            })
+            .is_some();
+
+        self.do_action_inner(action, allow_when_locked);
+
+        if leave_after {
+            self.set_binding_mode(None);
+        }
+    }
+
+    fn do_action_inner(&mut self, action: Action, allow_when_locked: bool) {
         if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
             return;
         }
@@ -847,6 +896,26 @@ impl State {
             Action::Spawn(command) => {
                 let (token, _) = self.niri.activation_state.create_external_token(None);
                 spawn(command, Some(token.clone()));
+            }
+            Action::EnterBindingMode(name) => {
+                // Entering a mode that does not exist would replace every ordinary bind with
+                // an empty set, leaving only the escape hatch: a keyboard that does nothing.
+                // Refusing here keeps a typo in the configuration from feeling like a freeze.
+                let exists = self
+                    .niri
+                    .config
+                    .borrow()
+                    .binding_modes
+                    .iter()
+                    .any(|mode| mode.name == name);
+                if exists {
+                    self.set_binding_mode(Some(name));
+                } else {
+                    warn!("no binding mode named {name:?}");
+                }
+            }
+            Action::ExitBindingMode => {
+                self.set_binding_mode(None);
             }
             Action::SpawnSh(command) => {
                 let (token, _) = self.niri.activation_state.create_external_token(None);
@@ -2963,7 +3032,12 @@ impl State {
                 .and_then(|trigger| {
                     let config = self.niri.config.borrow();
                     let bindings =
-                        make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                        make_binds_iter(
+                            &config,
+                            &mut self.niri.window_mru_ui,
+                            modifiers,
+                            self.niri.binding_mode.as_deref(),
+                        );
                     find_configured_bind(bindings, mod_key, trigger, mods)
                 }) {
                     self.niri.suppressed_buttons.insert(button_code);
@@ -3314,7 +3388,12 @@ impl State {
                         } else {
                             let config = self.niri.config.borrow();
                             let bindings =
-                                make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                                make_binds_iter(
+                            &config,
+                            &mut self.niri.window_mru_ui,
+                            modifiers,
+                            self.niri.binding_mode.as_deref(),
+                        );
                             let bind_left = find_configured_bind(
                                 bindings.clone(),
                                 mod_key,
@@ -3401,7 +3480,12 @@ impl State {
                     } else {
                         let config = self.niri.config.borrow();
                         let bindings =
-                            make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                            make_binds_iter(
+                            &config,
+                            &mut self.niri.window_mru_ui,
+                            modifiers,
+                            self.niri.binding_mode.as_deref(),
+                        );
                         let bind_up = find_configured_bind(
                             bindings.clone(),
                             mod_key,
@@ -3546,7 +3630,12 @@ impl State {
                 if ticks != 0 {
                     let config = self.niri.config.borrow();
                     let bindings =
-                        make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                        make_binds_iter(
+                            &config,
+                            &mut self.niri.window_mru_ui,
+                            modifiers,
+                            self.niri.binding_mode.as_deref(),
+                        );
                     let bind_left = find_configured_bind(
                         bindings.clone(),
                         mod_key,
@@ -3576,7 +3665,12 @@ impl State {
                 if ticks != 0 {
                     let config = self.niri.config.borrow();
                     let bindings =
-                        make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                        make_binds_iter(
+                            &config,
+                            &mut self.niri.window_mru_ui,
+                            modifiers,
+                            self.niri.binding_mode.as_deref(),
+                        );
                     let bind_up = find_configured_bind(
                         bindings.clone(),
                         mod_key,
@@ -5226,10 +5320,23 @@ fn make_binds_iter<'a>(
     config: &'a Config,
     mru: &'a mut WindowMruUi,
     mods: Modifiers,
+    binding_mode: Option<&str>,
 ) -> impl Iterator<Item = &'a Bind> + Clone {
+    // A mode named in state but absent from the configuration matches nothing. That is the
+    // deliberate outcome of reloading a configuration that deleted the active mode: the
+    // session falls back to the ordinary binds rather than being stuck in a mode with no
+    // definition and no way out.
+    let mode = binding_mode
+        .and_then(|name| config.binding_modes.iter().find(|mode| mode.name == name));
+
     // Figure out the binds to use depending on whether the MRU is enabled and/or open.
-    let general_binds = (!mru.is_open()).then_some(config.binds.0.iter());
+    // A mode replaces the ordinary binds outright, as in i3 and Sway: that is the whole
+    // point, since it is what frees the plain keys for the mode's own meanings.
+    let general_binds = (!mru.is_open() && mode.is_none()).then_some(config.binds.0.iter());
     let general_binds = general_binds.into_iter().flatten();
+
+    let mode_binds = mode.map(|mode| mode.binds.0.iter());
+    let mode_binds = mode_binds.into_iter().flatten();
 
     let mru_binds =
         (config.recent_windows.on || mru.is_open()).then_some(config.recent_windows.binds.iter());
@@ -5239,15 +5346,87 @@ fn make_binds_iter<'a>(
     let mru_open_binds = mru_open_binds.into_iter().flatten();
 
     // General binds take precedence over the MRU binds.
-    general_binds.chain(mru_binds).chain(mru_open_binds)
+    general_binds
+        .chain(mode_binds)
+        .chain(mru_binds)
+        .chain(mru_open_binds)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use niri_config::BindingMode;
 
     use super::*;
     use crate::animation::Clock;
+
+    #[test]
+    fn a_mode_replaces_the_ordinary_binds_and_an_unknown_one_falls_back() {
+        // Replacing rather than layering is the whole point: it is what frees the plain keys
+        // for the mode's own meanings, and it is what i3 and Sway do.
+        let bind = |keysym, modifiers, action| Bind {
+            key: Key {
+                trigger: Trigger::Keysym(keysym),
+                modifiers,
+            },
+            action,
+            repeat: true,
+            cooldown: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+        };
+
+        let mut config = Config::default();
+        // The MRU contributes its own binds and has nothing to do with what is under test.
+        config.recent_windows.on = false;
+        config.binds = Binds(vec![bind(
+            Keysym::Left,
+            Modifiers::COMPOSITOR,
+            Action::FocusColumnLeft,
+        )]);
+        config.binding_modes = vec![BindingMode {
+            name: String::from("monitor"),
+            binds: Binds(vec![bind(
+                Keysym::Left,
+                Modifiers::empty(),
+                Action::FocusMonitorLeft,
+            )]),
+            exit_on_action: false,
+        }];
+
+        let mut mru = WindowMruUi::new(Rc::new(RefCell::new(Config::default())));
+
+        let actions = |mru: &mut WindowMruUi, mode: Option<&str>| {
+            make_binds_iter(&config, mru, Modifiers::empty(), mode)
+                .map(|bind| bind.action.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // No mode: the ordinary binds.
+        assert_eq!(
+            actions(&mut mru, None),
+            vec![Action::FocusColumnLeft],
+            "without a mode the ordinary binds must be the ones in effect"
+        );
+
+        // In the mode: its binds instead, plus the escape hatch this mode did not define.
+        assert_eq!(
+            actions(&mut mru, Some("monitor")),
+            vec![Action::FocusMonitorLeft],
+            "a mode must replace the ordinary binds rather than layer over them"
+        );
+
+        // A mode named in state but absent from the configuration — which is what a reload
+        // that deleted the active mode leaves behind — must not strand the keyboard.
+        assert_eq!(
+            actions(&mut mru, Some("deleted")),
+            vec![Action::FocusColumnLeft],
+            "an unknown mode must fall back to the ordinary binds"
+        );
+    }
 
     #[test]
     fn bindings_suppress_keys() {

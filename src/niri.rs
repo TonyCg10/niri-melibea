@@ -392,6 +392,14 @@ pub struct Niri {
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
 
+    /// Name of the active binding mode, when one has been entered.
+    ///
+    /// Held by name rather than by index or reference so that reloading the configuration
+    /// while inside a mode resolves against the new configuration: a mode that survived the
+    /// reload keeps working, and one that was deleted simply stops matching, which drops the
+    /// session back to the ordinary binds instead of into a mode that no longer exists.
+    pub binding_mode: Option<String>,
+
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
 
@@ -2601,6 +2609,7 @@ impl Niri {
             exit_confirm_dialog,
 
             window_mru_ui,
+            binding_mode: None,
             pending_mru_commit: None,
 
             pick_window: None,

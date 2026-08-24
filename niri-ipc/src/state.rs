@@ -47,6 +47,9 @@ pub struct EventStreamState {
     /// State of the overview.
     pub overview: OverviewState,
 
+    /// State of the active binding mode.
+    pub binding_mode: BindingModeState,
+
     /// State of the config.
     pub config: ConfigState,
 
@@ -89,6 +92,13 @@ pub struct OverviewState {
     pub is_open: bool,
 }
 
+/// The binding mode state communicated over the event stream.
+#[derive(Debug, Default)]
+pub struct BindingModeState {
+    /// Name of the active binding mode, or `None` when the ordinary binds are in effect.
+    pub mode: Option<String>,
+}
+
 /// The config state communicated over the event stream.
 #[derive(Debug, Default)]
 pub struct ConfigState {
@@ -111,6 +121,7 @@ impl EventStreamStatePart for EventStreamState {
         events.extend(self.minimized_windows.replicate());
         events.extend(self.keyboard_layouts.replicate());
         events.extend(self.overview.replicate());
+        events.extend(self.binding_mode.replicate());
         events.extend(self.config.replicate());
         events.extend(self.casts.replicate());
         events
@@ -122,6 +133,7 @@ impl EventStreamStatePart for EventStreamState {
         let event = self.minimized_windows.apply(event)?;
         let event = self.keyboard_layouts.apply(event)?;
         let event = self.overview.apply(event)?;
+        let event = self.binding_mode.apply(event)?;
         let event = self.config.apply(event)?;
         let event = self.casts.apply(event)?;
         Some(event)
@@ -301,6 +313,24 @@ impl EventStreamStatePart for OverviewState {
         match event {
             Event::OverviewOpenedOrClosed { is_open } => {
                 self.is_open = is_open;
+            }
+            event => return Some(event),
+        }
+        None
+    }
+}
+
+impl EventStreamStatePart for BindingModeState {
+    fn replicate(&self) -> Vec<Event> {
+        vec![Event::BindingModeChanged {
+            mode: self.mode.clone(),
+        }]
+    }
+
+    fn apply(&mut self, event: Event) -> Option<Event> {
+        match event {
+            Event::BindingModeChanged { mode } => {
+                self.mode = mode;
             }
             event => return Some(event),
         }

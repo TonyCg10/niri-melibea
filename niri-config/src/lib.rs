@@ -88,6 +88,8 @@ pub struct Config {
     pub window_rules: Vec<WindowRule>,
     pub layer_rules: Vec<LayerRule>,
     pub binds: Binds,
+    /// Named binding modes, looked up by name when one is entered.
+    pub binding_modes: Vec<BindingMode>,
     pub switch_events: SwitchBinds,
     pub debug: Debug,
     pub workspaces: Vec<Workspace>,
@@ -165,6 +167,7 @@ where
                     | "window-rule"
                     | "layer-rule"
                     | "workspace"
+                    | "binding-mode"
                     | "include"
             ) && !seen.insert(name)
             {
@@ -212,6 +215,15 @@ where
                 "spawn-at-startup" => m_push!(spawn_at_startup),
                 "spawn-sh-at-startup" => m_push!(spawn_sh_at_startup),
                 "window-rule" => m_push!(window_rules),
+                "binding-mode" => {
+                    let part = BindingMode::decode_node(node, ctx)?;
+                    let mut config = config.borrow_mut();
+                    // Redefining a mode replaces it wholesale, for the same reason `binds`
+                    // replaces conflicting keys: a preconfigured file can be imported and then
+                    // overridden without having to unbind anything first.
+                    config.binding_modes.retain(|mode| mode.name != part.name);
+                    config.binding_modes.push(part);
+                }
                 "layer-rule" => m_push!(layer_rules),
                 "workspace" => m_push!(workspaces),
 
@@ -2248,6 +2260,7 @@ mod tests {
                     },
                 ],
             ),
+            binding_modes: [],
             switch_events: SwitchBinds {
                 lid_open: None,
                 lid_close: None,

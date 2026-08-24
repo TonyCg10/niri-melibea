@@ -1824,6 +1824,14 @@ pub enum Event {
         /// The new state of the overview.
         is_open: bool,
     },
+    /// The active binding mode changed.
+    ///
+    /// A mode is only usable if it can be seen, so this is what lets a shell draw an
+    /// indicator naming it. `None` means the ordinary binds are in effect again.
+    BindingModeChanged {
+        /// Name of the mode that is now active, or `None` for no mode.
+        mode: Option<String>,
+    },
     /// The configuration was reloaded.
     ///
     /// You will always receive this event when connecting to the event stream, indicating the last
