@@ -1,3 +1,4 @@
+pub mod binding_mode_indicator;
 pub mod config_error_notification;
 pub mod exit_confirm_dialog;
 pub mod hotkey_overlay;

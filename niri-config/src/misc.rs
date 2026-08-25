@@ -1,3 +1,4 @@
+use crate::animations::BindingModeIndicatorAnim;
 use crate::appearance::{Color, WorkspaceShadow, WorkspaceShadowPart, DEFAULT_BACKDROP_COLOR};
 use crate::utils::{Flag, MergeWith};
 use crate::FloatOrInt;
@@ -115,6 +116,66 @@ pub struct ClipboardPart {
 impl MergeWith<ClipboardPart> for Clipboard {
     fn merge_with(&mut self, part: &ClipboardPart) {
         merge!((self, part), disable_primary);
+    }
+}
+
+/// The soft side lights that show a binding mode is active.
+///
+/// Persistent modes need something on screen saying so: without it the same key means two
+/// different things depending on state nobody can see. This is a state indicator rather than
+/// a notification, which is why it has no duration — it lasts exactly as long as the mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BindingModeIndicator {
+    pub off: bool,
+    pub color: Color,
+    /// How far the light reaches inward from each side edge, in logical pixels.
+    pub reach: FloatOrInt<0, 2000>,
+    /// Vertical extent of each arc as a proportion of the output's height.
+    ///
+    /// A proportion rather than pixels so that one setting looks the same on a 4K panel and a
+    /// 1080p one standing next to it.
+    pub spread: FloatOrInt<0, 1>,
+    pub opacity: FloatOrInt<0, 1>,
+    pub animation: BindingModeIndicatorAnim,
+}
+
+impl Default for BindingModeIndicator {
+    fn default() -> Self {
+        Self {
+            off: false,
+            // Deliberately dim, and dimmer than seems right when reading the numbers. This is
+            // ambient light at the far edge of vision, not a highlight: it has to answer "is a
+            // mode on" for someone who glances, and stay out of the way of someone reading a
+            // window. The first attempt at these values was plainly too loud in use.
+            color: Color::from_rgba8_unpremul(0xc0, 0xc8, 0xff, 0xff),
+            reach: FloatOrInt(90.),
+            spread: FloatOrInt(0.45),
+            opacity: FloatOrInt(0.10),
+            animation: BindingModeIndicatorAnim::default(),
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct BindingModeIndicatorPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub color: Option<Color>,
+    #[knuffel(child, unwrap(argument))]
+    pub reach: Option<FloatOrInt<0, 2000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub spread: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child, unwrap(argument))]
+    pub opacity: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child)]
+    pub animation: Option<BindingModeIndicatorAnim>,
+}
+
+impl MergeWith<BindingModeIndicatorPart> for BindingModeIndicator {
+    fn merge_with(&mut self, part: &BindingModeIndicatorPart) {
+        self.off |= part.off;
+        merge_clone!((self, part), reach, spread, opacity, animation, color);
     }
 }
 

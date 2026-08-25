@@ -83,6 +83,7 @@ pub struct Config {
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
+    pub binding_mode_indicator: BindingModeIndicator,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -240,6 +241,10 @@ where
                     binds.retain(|bind| !part.0.iter().any(|new| new.key == bind.key));
                     // Add all new binds.
                     binds.extend(part.0);
+                }
+                "binding-mode-indicator" => {
+                    let part = BindingModeIndicatorPart::decode_node(node, ctx)?;
+                    config.borrow_mut().binding_mode_indicator.merge_with(&part);
                 }
                 "environment" => {
                     let part = Environment::decode_node(node, ctx)?;
@@ -1718,6 +1723,35 @@ mod tests {
                         a: 0.3137255,
                     },
                 },
+            },
+            binding_mode_indicator: BindingModeIndicator {
+                off: false,
+                color: Color {
+                    r: 0.7529412,
+                    g: 0.78431374,
+                    b: 1.0,
+                    a: 1.0,
+                },
+                reach: FloatOrInt(
+                    90.0,
+                ),
+                spread: FloatOrInt(
+                    0.45,
+                ),
+                opacity: FloatOrInt(
+                    0.1,
+                ),
+                animation: BindingModeIndicatorAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 180,
+                                curve: EaseOutQuad,
+                            },
+                        ),
+                    },
+                ),
             },
             environment: Environment(
                 [

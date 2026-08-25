@@ -165,6 +165,7 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
+use crate::ui::binding_mode_indicator::{BindingModeIndicator, BindingModeIndicatorRenderElement};
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
@@ -386,6 +387,7 @@ pub struct Niri {
 
     pub screenshot_ui: ScreenshotUi,
     pub config_error_notification: ConfigErrorNotification,
+    pub binding_mode_indicator: BindingModeIndicator,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
 
@@ -1691,6 +1693,13 @@ impl State {
             self.niri.window_mru_ui.update_config();
         }
 
+        // Outside any `changed` guard: this is the one thing here meant to be tuned by eye,
+        // and it can only be tuned by eye if editing the file is enough to see the result.
+        let indicator_config = self.niri.config.borrow().binding_mode_indicator;
+        self.niri
+            .binding_mode_indicator
+            .update_config(indicator_config);
+
         if xwls_changed {
             // If xwl-s was previously working and is now off, we don't try to kill it or stop
             // watching the sockets, for simplicity's sake.
@@ -2418,6 +2427,10 @@ impl Niri {
         let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
+        let binding_mode_indicator = BindingModeIndicator::new(
+            animation_clock.clone(),
+            config.borrow().binding_mode_indicator,
+        );
 
         let mut hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
         if !config_.hotkey_overlay.skip_at_startup {
@@ -2605,6 +2618,7 @@ impl Niri {
 
             screenshot_ui,
             config_error_notification,
+            binding_mode_indicator,
             hotkey_overlay,
             exit_confirm_dialog,
 
@@ -4063,6 +4077,7 @@ impl Niri {
 
         self.layout.advance_animations();
         self.config_error_notification.advance_animations();
+        self.binding_mode_indicator.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
@@ -4235,6 +4250,14 @@ impl Niri {
 
         // Next, the config error notification too.
         if let Some(element) = self.config_error_notification.render(ctx.renderer, output) {
+            push(element.into());
+        }
+
+        // The binding mode glow sits above windows so it is never hidden by one, but below
+        // the notification, which is the only thing here that should ever interrupt.
+        if let Some(element) =
+            self.binding_mode_indicator.render(output, ctx.target)
+        {
             push(element.into());
         }
 
@@ -4606,7 +4629,8 @@ impl Niri {
             let state = self.output_state.get_mut(output).unwrap();
             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
             state.unfinished_animations_remain |=
-                self.config_error_notification.are_animations_ongoing();
+                self.config_error_notification.are_animations_ongoing()
+                || self.binding_mode_indicator.are_animations_ongoing();
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
@@ -6532,6 +6556,7 @@ niri_render_elements! {
         ScreenshotUi = ScreenshotUiRenderElement,
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
+        BindingModeIndicator = BindingModeIndicatorRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,

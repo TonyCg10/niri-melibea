@@ -813,7 +813,12 @@ impl State {
         }
 
         self.niri.binding_mode = mode;
+        // Two audiences for the same fact: a shell that wants to name the mode, and the
+        // compositor's own glow for people whose shell draws nothing.
         self.ipc_binding_mode_changed();
+        let active = self.niri.binding_mode.is_some();
+        self.niri.binding_mode_indicator.set_active(active);
+        self.niri.queue_redraw_all();
     }
 
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {

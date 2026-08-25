@@ -254,6 +254,40 @@ impl Default for WindowFocusChangeAnim {
     }
 }
 
+/// How the binding mode indicator fades in and out.
+///
+/// Eased and short: it is acknowledging a key press, so it has to be finished before the next
+/// one. Long enough not to blink, short enough not to lag behind the mode it reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BindingModeIndicatorAnim(pub Animation);
+
+impl Default for BindingModeIndicatorAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 180,
+                curve: Curve::EaseOutQuad,
+            }),
+        })
+    }
+}
+
+impl<S> knuffel::Decode<S> for BindingModeIndicatorAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowResizeAnim {
     pub anim: Animation,

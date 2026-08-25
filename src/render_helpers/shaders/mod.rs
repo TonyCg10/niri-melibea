@@ -13,6 +13,7 @@ use crate::render_helpers::blur::BlurProgram;
 pub struct Shaders {
     pub border: Option<ShaderProgram>,
     pub shadow: Option<ShaderProgram>,
+    pub binding_mode_glow: Option<ShaderProgram>,
     pub clipped_surface: Option<GlesTexProgram>,
     pub postprocess_and_clip: Option<GlesTexProgram>,
     pub resize: Option<ShaderProgram>,
@@ -27,6 +28,7 @@ pub struct Shaders {
 pub enum ProgramType {
     Border,
     Shadow,
+    BindingModeGlow,
     Resize,
     Close,
     Open,
@@ -82,6 +84,21 @@ impl Shaders {
         )
         .map_err(|err| {
             warn!("error compiling shadow shader: {err:?}");
+        })
+        .ok();
+
+        let binding_mode_glow = ShaderProgram::compile(
+            renderer,
+            include_str!("binding_mode_glow.frag"),
+            &[
+                UniformName::new("glow_color", UniformType::_4f),
+                UniformName::new("reach", UniformType::_1f),
+                UniformName::new("spread", UniformType::_1f),
+            ],
+            &[],
+        )
+        .map_err(|err| {
+            warn!("error compiling binding mode glow shader: {err:?}");
         })
         .ok();
 
@@ -151,6 +168,7 @@ impl Shaders {
         Self {
             border,
             shadow,
+            binding_mode_glow,
             clipped_surface,
             postprocess_and_clip,
             resize,
@@ -200,6 +218,7 @@ impl Shaders {
         match program {
             ProgramType::Border => self.border.clone(),
             ProgramType::Shadow => self.shadow.clone(),
+            ProgramType::BindingModeGlow => self.binding_mode_glow.clone(),
             ProgramType::Resize => self
                 .custom_resize
                 .borrow()
