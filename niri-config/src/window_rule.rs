@@ -135,6 +135,15 @@ pub struct Match {
     pub is_window_cast_target: Option<bool>,
     #[knuffel(property)]
     pub is_urgent: Option<bool>,
+    /// Whether this window was opened by another one: a dialog, a file chooser, a preferences
+    /// window. Matched from the toplevel's parent, so it is known before the window maps and
+    /// can therefore decide how it opens.
+    ///
+    /// Note that a program opening a second ordinary window — a browser's "open in window",
+    /// say — is not a child in this sense. It has no parent toplevel, and nothing about it
+    /// distinguishes it from the first window except its title.
+    #[knuffel(property)]
+    pub is_transient: Option<bool>,
     #[knuffel(property)]
     pub at_startup: Option<bool>,
 }

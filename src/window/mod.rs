@@ -149,6 +149,14 @@ impl<'a> WindowRef<'a> {
         }
     }
 
+    /// Whether another window opened this one.
+    ///
+    /// Read from the toplevel's parent rather than from layout state, so it answers the same
+    /// before the window maps — which is when the rule that decides floating is resolved.
+    pub fn is_transient(self) -> bool {
+        self.toplevel().parent().is_some()
+    }
+
     pub fn is_active_in_column(self) -> bool {
         match self {
             WindowRef::Unmapped(_) => true,
@@ -389,6 +397,12 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
 
     if let Some(is_focused) = m.is_focused {
         if window.is_focused() != is_focused {
+            return false;
+        }
+    }
+
+    if let Some(is_transient) = m.is_transient {
+        if window.is_transient() != is_transient {
             return false;
         }
     }
