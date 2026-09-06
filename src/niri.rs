@@ -15,7 +15,7 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
 use niri_config::{
-    Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
+    Config, FloatOrInt, Key, ModKey, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
@@ -169,6 +169,7 @@ use crate::ui::binding_mode_indicator::{BindingModeIndicator, BindingModeIndicat
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
+use crate::ui::magnifier::{MagnifiedRenderElement, Magnifier};
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
@@ -375,6 +376,7 @@ pub struct Niri {
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_wheel_tracker: ScrollTracker,
     pub mods_with_mouse_binds: HashSet<Modifiers>,
+    pub mod_key: ModKey,
     pub mods_with_wheel_binds: HashSet<Modifiers>,
     pub vertical_finger_scroll_tracker: ScrollTracker,
     pub horizontal_finger_scroll_tracker: ScrollTracker,
@@ -388,6 +390,7 @@ pub struct Niri {
     pub screenshot_ui: ScreenshotUi,
     pub config_error_notification: ConfigErrorNotification,
     pub binding_mode_indicator: BindingModeIndicator,
+    pub magnifier: Magnifier,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
 
@@ -1535,16 +1538,31 @@ impl State {
             preserved_output_config = Some(mem::take(&mut old_config.outputs));
         }
 
-        let binds_changed = config.binds != old_config.binds;
+        // Modes count as binds here. They contribute to the reserved-modifier sets, so a
+        // configuration that only edited a mode still has to recompute them — otherwise the
+        // old reservation outlives the bind that asked for it, and the fix for a mode that
+        // swallowed the wheel would appear to do nothing.
+        let binds_changed =
+            config.binds != old_config.binds || config.binding_modes != old_config.binding_modes;
         let new_mod_key = self.backend.mod_key(&config);
         if new_mod_key != self.backend.mod_key(&old_config) || binds_changed {
             self.niri
                 .hotkey_overlay
                 .on_hotkey_config_updated(new_mod_key);
-            self.niri.mods_with_mouse_binds = mods_with_mouse_binds(new_mod_key, &config.binds);
-            self.niri.mods_with_wheel_binds = mods_with_wheel_binds(new_mod_key, &config.binds);
+            self.niri.mod_key = new_mod_key;
+            // Inlined rather than calling the helper: the configuration is already borrowed
+            // for the whole of this function. The name is cloned so the lookup does not hold
+            // a borrow of `self.niri` across the assignments below.
+            let active_name = self.niri.binding_mode.clone();
+            let active = active_name
+                .as_deref()
+                .and_then(|name| config.binding_modes.iter().find(|mode| mode.name == name));
+            self.niri.mods_with_mouse_binds =
+                mods_with_mouse_binds(new_mod_key, &config.binds, active);
+            self.niri.mods_with_wheel_binds =
+                mods_with_wheel_binds(new_mod_key, &config.binds, active);
             self.niri.mods_with_finger_scroll_binds =
-                mods_with_finger_scroll_binds(new_mod_key, &config.binds);
+                mods_with_finger_scroll_binds(new_mod_key, &config.binds, active);
         }
 
         if config.window_rules != old_config.window_rules {
@@ -1699,6 +1717,8 @@ impl State {
         self.niri
             .binding_mode_indicator
             .update_config(indicator_config);
+        let magnifier_config = self.niri.config.borrow().magnifier;
+        self.niri.magnifier.update_config(magnifier_config);
 
         if xwls_changed {
             // If xwl-s was previously working and is now off, we don't try to kill it or stop
@@ -2419,14 +2439,17 @@ impl Niri {
             CursorManager::new(&config_.cursor.xcursor_theme, config_.cursor.xcursor_size);
 
         let mod_key = backend.mod_key(&config.borrow());
-        let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds);
-        let mods_with_wheel_binds = mods_with_wheel_binds(mod_key, &config_.binds);
-        let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
+        // No mode is active at startup, so these are the ordinary binds.
+        let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds, None);
+        let mods_with_wheel_binds = mods_with_wheel_binds(mod_key, &config_.binds, None);
+        let mods_with_finger_scroll_binds =
+            mods_with_finger_scroll_binds(mod_key, &config_.binds, None);
 
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
         let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
+        let magnifier = Magnifier::new(animation_clock.clone(), config.borrow().magnifier);
         let binding_mode_indicator = BindingModeIndicator::new(
             animation_clock.clone(),
             config.borrow().binding_mode_indicator,
@@ -2606,6 +2629,7 @@ impl Niri {
             vertical_wheel_tracker: ScrollTracker::new(120),
             horizontal_wheel_tracker: ScrollTracker::new(120),
             mods_with_mouse_binds,
+            mod_key,
             mods_with_wheel_binds,
 
             // 10 is copied from Clutter: DISCRETE_SCROLL_STEP.
@@ -2619,6 +2643,7 @@ impl Niri {
             screenshot_ui,
             config_error_notification,
             binding_mode_indicator,
+            magnifier,
             hotkey_overlay,
             exit_confirm_dialog,
 
@@ -4078,6 +4103,7 @@ impl Niri {
         self.layout.advance_animations();
         self.config_error_notification.advance_animations();
         self.binding_mode_indicator.advance_animations();
+        self.magnifier.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
@@ -4172,15 +4198,78 @@ impl Niri {
 
     pub fn render_to_vec<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<R>,
+        mut ctx: RenderCtx<R>,
         output: &Output,
         include_pointer: bool,
     ) -> Vec<OutputRenderElements<R>> {
+        // Magnification is the last thing done to the picture, because it magnifies the
+        // picture: everything else has already decided what the output shows, and this only
+        // decides how large it is shown.
+        //
+        // Deliberately not applied to captures. A screenshot or a screencast should carry what
+        // the screen shows, not how large one person needed it while looking at it.
+        if ctx.target == RenderTarget::Output && self.magnifier.is_active() {
+            if let Some(magnified) = self.magnify(ctx.r(), output, include_pointer) {
+                return vec![magnified];
+            }
+        }
+
         let mut elements = Vec::new();
         self.render(ctx, output, include_pointer, &mut |elem| {
             elements.push(elem)
         });
         elements
+    }
+
+    /// Scales the whole output about the pointer, or gives up and leaves it alone.
+    ///
+    /// Returning `None` on failure rather than propagating is deliberate: a magnifier that
+    /// cannot allocate its texture should stop magnifying, not stop drawing the screen.
+    fn magnify<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        output: &Output,
+        include_pointer: bool,
+    ) -> Option<OutputRenderElements<R>> {
+        let output_geo = self.global_space.output_geometry(output)?;
+        let pointer = self.seat.get_pointer()?;
+        let global = pointer.current_location();
+
+        // Only the output the pointer is on. The magnifier follows the pointer, and there is
+        // one pointer: magnifying the others would enlarge a view centred on a place their
+        // own screen does not contain, which is neither useful nor what "magnify around the
+        // cursor" means with three monitors.
+        if !output_geo.to_f64().contains(global) {
+            return None;
+        }
+
+        // Output-local, because the offscreen holds this output alone and knows nothing about
+        // where it sits among the others.
+        let pointer_local = global - output_geo.loc.to_f64();
+        let scale = Scale::from(output.current_scale().fractional_scale());
+
+        // Built in a GLES context on purpose, the same way a tile builds its own elements
+        // before an alpha animation offscreens them: the offscreen renders through the primary
+        // renderer, so what goes into it has to be addressed to that renderer too.
+        let mut ctx = ctx.as_gles();
+        let mut elements = Vec::new();
+        self.render(ctx.r(), output, include_pointer, &mut |elem| {
+            elements.push(elem)
+        });
+
+        match self.magnifier.magnify(
+            ctx.renderer,
+            scale,
+            pointer_local,
+            output_size(output),
+            &elements,
+        ) {
+            Ok(elem) => Some(OutputRenderElements::Magnified(elem)),
+            Err(err) => {
+                warn!("error magnifying the output: {err:?}");
+                None
+            }
+        }
     }
 
     pub fn render<R: NiriRenderer>(
@@ -4255,9 +4344,7 @@ impl Niri {
 
         // The binding mode glow sits above windows so it is never hidden by one, but below
         // the notification, which is the only thing here that should ever interrupt.
-        if let Some(element) =
-            self.binding_mode_indicator.render(output, ctx.target)
-        {
+        if let Some(element) = self.binding_mode_indicator.render(output, ctx.target) {
             push(element.into());
         }
 
@@ -4630,7 +4717,8 @@ impl Niri {
             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
             state.unfinished_animations_remain |=
                 self.config_error_notification.are_animations_ongoing()
-                || self.binding_mode_indicator.are_animations_ongoing();
+                    || self.binding_mode_indicator.are_animations_ongoing()
+                    || self.magnifier.are_animations_ongoing();
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
@@ -6344,6 +6432,26 @@ impl Niri {
         // bit, and even if the delay was zero, we're drawing the same contents anyway.
     }
 
+    /// Rebuilds the sets of modifiers that reserve scroll and mouse triggers.
+    ///
+    /// Called whenever the binds in effect change: on a configuration reload, and on entering
+    /// or leaving a binding mode. Niri consults these to decide whether to swallow an event
+    /// rather than pass it to the focused window, so they have to describe the binds active
+    /// *now* — a set left describing a mode nobody is in reserves input for nothing.
+    pub fn recompute_mods_with_binds(&mut self) {
+        let config = Rc::clone(&self.config);
+        let config = config.borrow();
+        let active = self
+            .binding_mode
+            .as_deref()
+            .and_then(|name| config.binding_modes.iter().find(|mode| mode.name == name));
+
+        self.mods_with_mouse_binds = mods_with_mouse_binds(self.mod_key, &config.binds, active);
+        self.mods_with_wheel_binds = mods_with_wheel_binds(self.mod_key, &config.binds, active);
+        self.mods_with_finger_scroll_binds =
+            mods_with_finger_scroll_binds(self.mod_key, &config.binds, active);
+    }
+
     pub fn recompute_window_rules(&mut self) {
         let _span = tracy_client::span!("Niri::recompute_window_rules");
 
@@ -6557,6 +6665,7 @@ niri_render_elements! {
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         BindingModeIndicator = BindingModeIndicatorRenderElement,
+        Magnified = MagnifiedRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,

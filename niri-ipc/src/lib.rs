@@ -945,6 +945,12 @@ pub enum Action {
     },
     /// Toggle (open/close) the Overview.
     ToggleOverview {},
+    /// Magnify the screen around the pointer by one step.
+    MagnifyIn {},
+    /// Reduce the magnification by one step, stopping at unmagnified.
+    MagnifyOut {},
+    /// Return the screen to its unmagnified size.
+    MagnifyReset {},
     /// Open the Overview.
     OpenOverview {},
     /// Close the Overview.

@@ -84,6 +84,7 @@ pub struct Config {
     pub gestures: Gestures,
     pub overview: Overview,
     pub binding_mode_indicator: BindingModeIndicator,
+    pub magnifier: Magnifier,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -241,6 +242,10 @@ where
                     binds.retain(|bind| !part.0.iter().any(|new| new.key == bind.key));
                     // Add all new binds.
                     binds.extend(part.0);
+                }
+                "magnifier" => {
+                    let part = MagnifierPart::decode_node(node, ctx)?;
+                    config.borrow_mut().magnifier.merge_with(&part);
                 }
                 "binding-mode-indicator" => {
                     let part = BindingModeIndicatorPart::decode_node(node, ctx)?;
@@ -1747,6 +1752,26 @@ mod tests {
                         kind: Easing(
                             EasingParams {
                                 duration_ms: 180,
+                                curve: EaseOutQuad,
+                            },
+                        ),
+                    },
+                ),
+            },
+            magnifier: Magnifier {
+                off: false,
+                step: FloatOrInt(
+                    1.5,
+                ),
+                max: FloatOrInt(
+                    8.0,
+                ),
+                animation: MagnifierAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 150,
                                 curve: EaseOutQuad,
                             },
                         ),

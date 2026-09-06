@@ -53,9 +53,10 @@ impl BindingMode {
     /// part of the mode as configured: it can be inspected, tested, and listed like any
     /// other bind. A mode that binds Escape to something deliberate keeps its own meaning.
     fn add_escape_hatch(&mut self) {
-        let binds_escape = self.binds.0.iter().any(|bind| {
-            matches!(bind.key.trigger, Trigger::Keysym(key) if key == Self::ESCAPE)
-        });
+        let binds_escape =
+            self.binds.0.iter().any(
+                |bind| matches!(bind.key.trigger, Trigger::Keysym(key) if key == Self::ESCAPE),
+            );
         if binds_escape {
             return;
         }
@@ -170,6 +171,12 @@ pub enum Action {
     EnterBindingMode(#[knuffel(argument)] String),
     /// Leave the current binding mode. Does nothing when no mode is active.
     ExitBindingMode,
+    /// Magnify the screen around the pointer by one step.
+    MagnifyIn,
+    /// Reduce the magnification by one step, stopping at unmagnified.
+    MagnifyOut,
+    /// Return to unmagnified in one move.
+    MagnifyReset,
     SpawnSh(#[knuffel(argument)] String),
     DoScreenTransition(#[knuffel(property(name = "delay-ms"))] Option<u16>),
     #[knuffel(skip)]
@@ -789,6 +796,9 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ClearDynamicCastTarget {} => Self::ClearDynamicCastTarget,
             niri_ipc::Action::StopCast { session_id } => Self::StopCast(session_id),
             niri_ipc::Action::ToggleOverview {} => Self::ToggleOverview,
+            niri_ipc::Action::MagnifyIn {} => Self::MagnifyIn,
+            niri_ipc::Action::MagnifyOut {} => Self::MagnifyOut,
+            niri_ipc::Action::MagnifyReset {} => Self::MagnifyReset,
             niri_ipc::Action::OpenOverview {} => Self::OpenOverview,
             niri_ipc::Action::CloseOverview {} => Self::CloseOverview,
             niri_ipc::Action::ToggleWindowUrgent { id } => Self::ToggleWindowUrgent(id),

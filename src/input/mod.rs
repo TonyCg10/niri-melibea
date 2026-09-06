@@ -7,7 +7,8 @@ use std::time::Duration;
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
-    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
+    Action, Bind, BindingMode, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds,
+    Trigger,
 };
 use niri_ipc::{LayoutSwitchTarget, WindowTransition};
 use smithay::backend::input::{
@@ -661,13 +662,12 @@ impl State {
 
                 let res = {
                     let config = this.niri.config.borrow();
-                    let bindings =
-                        make_binds_iter(
-                            &config,
-                            &mut this.niri.window_mru_ui,
-                            modifiers,
-                            this.niri.binding_mode.as_deref(),
-                        );
+                    let bindings = make_binds_iter(
+                        &config,
+                        &mut this.niri.window_mru_ui,
+                        modifiers,
+                        this.niri.binding_mode.as_deref(),
+                    );
 
                     should_intercept_key(
                         &mut this.niri.suppressed_keys,
@@ -813,6 +813,8 @@ impl State {
         }
 
         self.niri.binding_mode = mode;
+        // The binds in effect just changed, and with them which modifiers reserve the wheel.
+        self.niri.recompute_mods_with_binds();
         // Two audiences for the same fact: a shell that wants to name the mode, and the
         // compositor's own glow for people whose shell draws nothing.
         self.ipc_binding_mode_changed();
@@ -921,6 +923,18 @@ impl State {
             }
             Action::ExitBindingMode => {
                 self.set_binding_mode(None);
+            }
+            Action::MagnifyIn => {
+                self.niri.magnifier.zoom_in();
+                self.niri.queue_redraw_all();
+            }
+            Action::MagnifyOut => {
+                self.niri.magnifier.zoom_out();
+                self.niri.queue_redraw_all();
+            }
+            Action::MagnifyReset => {
+                self.niri.magnifier.reset();
+                self.niri.queue_redraw_all();
             }
             Action::SpawnSh(command) => {
                 let (token, _) = self.niri.activation_state.create_external_token(None);
@@ -3036,13 +3050,12 @@ impl State {
                 }
                 .and_then(|trigger| {
                     let config = self.niri.config.borrow();
-                    let bindings =
-                        make_binds_iter(
-                            &config,
-                            &mut self.niri.window_mru_ui,
-                            modifiers,
-                            self.niri.binding_mode.as_deref(),
-                        );
+                    let bindings = make_binds_iter(
+                        &config,
+                        &mut self.niri.window_mru_ui,
+                        modifiers,
+                        self.niri.binding_mode.as_deref(),
+                    );
                     find_configured_bind(bindings, mod_key, trigger, mods)
                 }) {
                     self.niri.suppressed_buttons.insert(button_code);
@@ -3392,13 +3405,12 @@ impl State {
                             (bind_left, bind_right)
                         } else {
                             let config = self.niri.config.borrow();
-                            let bindings =
-                                make_binds_iter(
-                            &config,
-                            &mut self.niri.window_mru_ui,
-                            modifiers,
-                            self.niri.binding_mode.as_deref(),
-                        );
+                            let bindings = make_binds_iter(
+                                &config,
+                                &mut self.niri.window_mru_ui,
+                                modifiers,
+                                self.niri.binding_mode.as_deref(),
+                            );
                             let bind_left = find_configured_bind(
                                 bindings.clone(),
                                 mod_key,
@@ -3484,8 +3496,7 @@ impl State {
                         (bind_up, bind_down)
                     } else {
                         let config = self.niri.config.borrow();
-                        let bindings =
-                            make_binds_iter(
+                        let bindings = make_binds_iter(
                             &config,
                             &mut self.niri.window_mru_ui,
                             modifiers,
@@ -3634,13 +3645,12 @@ impl State {
                     .accumulate(horizontal);
                 if ticks != 0 {
                     let config = self.niri.config.borrow();
-                    let bindings =
-                        make_binds_iter(
-                            &config,
-                            &mut self.niri.window_mru_ui,
-                            modifiers,
-                            self.niri.binding_mode.as_deref(),
-                        );
+                    let bindings = make_binds_iter(
+                        &config,
+                        &mut self.niri.window_mru_ui,
+                        modifiers,
+                        self.niri.binding_mode.as_deref(),
+                    );
                     let bind_left = find_configured_bind(
                         bindings.clone(),
                         mod_key,
@@ -3669,13 +3679,12 @@ impl State {
                     .accumulate(vertical);
                 if ticks != 0 {
                     let config = self.niri.config.borrow();
-                    let bindings =
-                        make_binds_iter(
-                            &config,
-                            &mut self.niri.window_mru_ui,
-                            modifiers,
-                            self.niri.binding_mode.as_deref(),
-                        );
+                    let bindings = make_binds_iter(
+                        &config,
+                        &mut self.niri.window_mru_ui,
+                        modifiers,
+                        self.niri.binding_mode.as_deref(),
+                    );
                     let bind_up = find_configured_bind(
                         bindings.clone(),
                         mod_key,
@@ -5234,6 +5243,27 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
     }
 }
 
+/// The modifiers that currently reserve a scroll or mouse trigger.
+///
+/// Only the binds actually in effect count, which is why this takes the one active mode
+/// rather than all of them. Niri uses these sets to decide whether to swallow an event
+/// instead of passing it to the focused window, so a modifier listed here is reserved for as
+/// long as it is listed — and a mode that binds the bare wheel would otherwise take scrolling
+/// away from every application for the whole session, not just while that mode is on.
+///
+/// A mode replaces the ordinary binds rather than adding to them, matching `make_binds_iter`.
+pub fn mods_with_active_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    active_mode: Option<&BindingMode>,
+    triggers: &[Trigger],
+) -> HashSet<Modifiers> {
+    match active_mode {
+        Some(mode) => mods_with_binds(mod_key, &mode.binds, triggers),
+        None => mods_with_binds(mod_key, binds, triggers),
+    }
+}
+
 pub fn mods_with_binds(mod_key: ModKey, binds: &Binds, triggers: &[Trigger]) -> HashSet<Modifiers> {
     let mut rv = HashSet::new();
     for bind in &binds.0 {
@@ -5253,10 +5283,15 @@ pub fn mods_with_binds(mod_key: ModKey, binds: &Binds, triggers: &[Trigger]) -> 
     rv
 }
 
-pub fn mods_with_mouse_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
-    mods_with_binds(
+pub fn mods_with_mouse_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    active_mode: Option<&BindingMode>,
+) -> HashSet<Modifiers> {
+    mods_with_active_binds(
         mod_key,
         binds,
+        active_mode,
         &[
             Trigger::MouseLeft,
             Trigger::MouseRight,
@@ -5267,10 +5302,15 @@ pub fn mods_with_mouse_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifier
     )
 }
 
-pub fn mods_with_wheel_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
-    mods_with_binds(
+pub fn mods_with_wheel_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    active_mode: Option<&BindingMode>,
+) -> HashSet<Modifiers> {
+    mods_with_active_binds(
         mod_key,
         binds,
+        active_mode,
         &[
             Trigger::WheelScrollUp,
             Trigger::WheelScrollDown,
@@ -5280,10 +5320,15 @@ pub fn mods_with_wheel_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifier
     )
 }
 
-pub fn mods_with_finger_scroll_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
-    mods_with_binds(
+pub fn mods_with_finger_scroll_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    active_mode: Option<&BindingMode>,
+) -> HashSet<Modifiers> {
+    mods_with_active_binds(
         mod_key,
         binds,
+        active_mode,
         &[
             Trigger::TouchpadScrollUp,
             Trigger::TouchpadScrollDown,
@@ -5331,8 +5376,8 @@ fn make_binds_iter<'a>(
     // deliberate outcome of reloading a configuration that deleted the active mode: the
     // session falls back to the ordinary binds rather than being stuck in a mode with no
     // definition and no way out.
-    let mode = binding_mode
-        .and_then(|name| config.binding_modes.iter().find(|mode| mode.name == name));
+    let mode =
+        binding_mode.and_then(|name| config.binding_modes.iter().find(|mode| mode.name == name));
 
     // Figure out the binds to use depending on whether the MRU is enabled and/or open.
     // A mode replaces the ordinary binds outright, as in i3 and Sway: that is the whole
@@ -5366,6 +5411,43 @@ mod tests {
 
     use super::*;
     use crate::animation::Clock;
+
+    #[test]
+    fn a_modes_wheel_bind_reserves_the_wheel_only_while_that_mode_is_on() {
+        // Niri swallows a scroll instead of passing it to the window whenever its modifiers
+        // appear in this set. A mode binding the bare wheel therefore has to leave the set
+        // untouched while that mode is off, or scrolling stops working everywhere for the
+        // rest of the session — which is exactly what happened once.
+        let zoom = BindingMode {
+            name: String::from("zoom"),
+            binds: Binds(vec![Bind {
+                key: Key {
+                    trigger: Trigger::WheelScrollUp,
+                    modifiers: Modifiers::empty(),
+                },
+                action: Action::FocusColumnLeft,
+                repeat: true,
+                cooldown: None,
+                allow_when_locked: false,
+                allow_inhibiting: true,
+                hotkey_overlay_title: None,
+            }]),
+            exit_on_action: false,
+        };
+        let ordinary = Binds(Vec::new());
+
+        let off = mods_with_wheel_binds(ModKey::Super, &ordinary, None);
+        assert!(
+            !off.contains(&Modifiers::empty()),
+            "the bare wheel must stay with applications while the mode is off"
+        );
+
+        let on = mods_with_wheel_binds(ModKey::Super, &ordinary, Some(&zoom));
+        assert!(
+            on.contains(&Modifiers::empty()),
+            "inside the mode the wheel is the mode's to take"
+        );
+    }
 
     #[test]
     fn a_mode_replaces_the_ordinary_binds_and_an_unknown_one_falls_back() {

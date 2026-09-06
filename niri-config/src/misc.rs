@@ -1,4 +1,4 @@
-use crate::animations::BindingModeIndicatorAnim;
+use crate::animations::{BindingModeIndicatorAnim, MagnifierAnim};
 use crate::appearance::{Color, WorkspaceShadow, WorkspaceShadowPart, DEFAULT_BACKDROP_COLOR};
 use crate::utils::{Flag, MergeWith};
 use crate::FloatOrInt;
@@ -116,6 +116,49 @@ pub struct ClipboardPart {
 impl MergeWith<ClipboardPart> for Clipboard {
     fn merge_with(&mut self, part: &ClipboardPart) {
         merge!((self, part), disable_primary);
+    }
+}
+
+/// The screen magnifier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Magnifier {
+    pub off: bool,
+    /// Multiplied in on each zoom-in, divided out on each zoom-out.
+    ///
+    /// Geometric rather than additive so the steps feel even: going 1x to 1.5x and 4x to 6x are
+    /// the same change to look at, while adding a fixed amount would crawl at the top.
+    pub step: FloatOrInt<1, 4>,
+    pub max: FloatOrInt<1, 32>,
+    pub animation: MagnifierAnim,
+}
+
+impl Default for Magnifier {
+    fn default() -> Self {
+        Self {
+            off: false,
+            step: FloatOrInt(1.5),
+            max: FloatOrInt(8.),
+            animation: MagnifierAnim::default(),
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct MagnifierPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub step: Option<FloatOrInt<1, 4>>,
+    #[knuffel(child, unwrap(argument))]
+    pub max: Option<FloatOrInt<1, 32>>,
+    #[knuffel(child)]
+    pub animation: Option<MagnifierAnim>,
+}
+
+impl MergeWith<MagnifierPart> for Magnifier {
+    fn merge_with(&mut self, part: &MagnifierPart) {
+        self.off |= part.off;
+        merge_clone!((self, part), step, max, animation);
     }
 }
 
