@@ -1,4 +1,8 @@
 /target
 /result
 
-.idea.*.pending-snap
+.idea
+
+# insta leftovers from an interrupted snapshot review
+.*.pending-snap
+

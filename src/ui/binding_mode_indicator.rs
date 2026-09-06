@@ -37,7 +37,10 @@ niri_render_elements! {
 enum State {
     Hidden,
     /// Fading in or out. The animation runs 0 to 1 in both directions; `to` says which.
-    Fading { anim: Animation, to: f64 },
+    Fading {
+        anim: Animation,
+        to: f64,
+    },
     Shown,
 }
 
@@ -73,7 +76,13 @@ impl BindingModeIndicator {
         }
 
         self.state = State::Fading {
-            anim: Animation::new(self.clock.clone(), current, target, 0., self.config.animation.0),
+            anim: Animation::new(
+                self.clock.clone(),
+                current,
+                target,
+                0.,
+                self.config.animation.0,
+            ),
             to: target,
         };
     }
@@ -90,7 +99,11 @@ impl BindingModeIndicator {
     pub fn advance_animations(&mut self) {
         if let State::Fading { anim, to } = &self.state {
             if anim.is_done() {
-                self.state = if *to == 1. { State::Shown } else { State::Hidden };
+                self.state = if *to == 1. {
+                    State::Shown
+                } else {
+                    State::Hidden
+                };
             }
         }
     }
@@ -129,10 +142,7 @@ impl BindingModeIndicator {
                 Uniform::new("reach", self.config.reach.0 as f32),
                 // Written as a proportion of the output's height so one setting looks the same
                 // on a 4K panel and a 1080p one side by side.
-                Uniform::new(
-                    "spread",
-                    (size.h * self.config.spread.0 * 0.5) as f32,
-                ),
+                Uniform::new("spread", (size.h * self.config.spread.0 * 0.5) as f32),
             ]
             .as_slice(),
         );
