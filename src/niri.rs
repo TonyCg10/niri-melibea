@@ -6478,14 +6478,20 @@ impl Niri {
                         .floating
                         .filter(|floating| *floating != mapped.is_floating())
                     {
-                        relayer.push((mapped.window.clone(), floating));
+                        relayer.push((
+                            mapped.window.clone(),
+                            floating,
+                            mapped.rules().default_width.flatten(),
+                            mapped.rules().default_height.flatten(),
+                        ));
                     }
                     windows.push(mapped.window.clone());
                 }
             });
             let changed = !windows.is_empty();
-            for (win, floating) in relayer {
-                self.layout.set_window_floating(Some(&win), floating);
+            for (win, floating, width, height) in relayer {
+                self.layout
+                    .set_window_floating_sized(&win, floating, width, height);
             }
             for win in windows {
                 self.layout.update_window(&win, None);

@@ -3646,6 +3646,33 @@ impl<W: LayoutElement> Layout<W> {
         workspace.toggle_window_floating(window);
     }
 
+    /// Moves a window between the tiling and floating layers, sizing it on arrival.
+    ///
+    /// A window that reaches the floating layer after it opened keeps whatever size the tiling
+    /// layer gave it, which for a full-width tile is the whole working area. The rule's default
+    /// sizes are the same ones a window that opened floating would have gotten, so applying them
+    /// here lands both paths in the same place.
+    pub fn set_window_floating_sized(
+        &mut self,
+        window: &W::Id,
+        floating: bool,
+        width: Option<PresetSize>,
+        height: Option<PresetSize>,
+    ) {
+        self.set_window_floating(Some(window), floating);
+
+        if !floating {
+            return;
+        }
+
+        if let Some(width) = width {
+            self.set_window_width(Some(window), width.into());
+        }
+        if let Some(height) = height {
+            self.set_window_height(Some(window), height.into());
+        }
+    }
+
     pub fn set_window_floating(&mut self, window: Option<&W::Id>, floating: bool) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {

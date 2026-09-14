@@ -1415,9 +1415,13 @@ impl State {
                     .rules()
                     .floating
                     .filter(|floating| *floating != mapped.is_floating());
+                let width = mapped.rules().default_width.flatten();
+                let height = mapped.rules().default_height.flatten();
 
                 if let Some(floating) = floating {
-                    self.niri.layout.set_window_floating(Some(&window), floating);
+                    self.niri
+                        .layout
+                        .set_window_floating_sized(&window, floating, width, height);
                 }
 
                 self.niri.layout.update_window(&window, None);
