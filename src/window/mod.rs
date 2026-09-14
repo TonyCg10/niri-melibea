@@ -149,14 +149,6 @@ impl<'a> WindowRef<'a> {
         }
     }
 
-    /// Whether another window opened this one.
-    ///
-    /// Read from the toplevel's parent rather than from layout state, so it answers the same
-    /// before the window maps — which is when the rule that decides floating is resolved.
-    pub fn is_transient(self) -> bool {
-        self.toplevel().parent().is_some()
-    }
-
     pub fn is_active_in_column(self) -> bool {
         match self {
             WindowRef::Unmapped(_) => true,
@@ -401,8 +393,17 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
         }
     }
 
+    // Whether another window opened this one: a dialog, a file chooser, a preferences window.
+    //
+    // Read straight off the role the caller already holds, never through
+    // `ToplevelSurface::parent()`. That accessor locks the very same `XdgToplevelSurfaceData`
+    // mutex this `role` borrow is holding, and a std mutex is not reentrant — taking it twice
+    // on the compositor thread hangs the whole session on the first window that resolves rules.
+    //
+    // The parent also lives on the role rather than in layout state, so it reads the same
+    // before the window maps, which is when the rule that decides floating is resolved.
     if let Some(is_transient) = m.is_transient {
-        if window.is_transient() != is_transient {
+        if role.parent.is_some() != is_transient {
             return false;
         }
     }
