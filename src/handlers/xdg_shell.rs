@@ -41,7 +41,7 @@ use crate::input::move_grab::MoveGrab;
 use crate::input::resize_grab::ResizeGrab;
 use crate::input::touch_resize_grab::TouchResizeGrab;
 use crate::input::{PointerOrTouchStartData, DOUBLE_CLICK_TIME};
-use crate::layout::ActivateWindow;
+use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -1409,6 +1409,17 @@ impl State {
                 drop(config);
                 let output = output.cloned();
                 let window = mapped.window.clone();
+                // A window that renames itself after mapping can only be recognized here, which
+                // is past the point where `open-floating` had its say.
+                let floating = mapped
+                    .rules()
+                    .floating
+                    .filter(|floating| *floating != mapped.is_floating());
+
+                if let Some(floating) = floating {
+                    self.niri.layout.set_window_floating(Some(&window), floating);
+                }
+
                 self.niri.layout.update_window(&window, None);
 
                 if let Some(output) = output {

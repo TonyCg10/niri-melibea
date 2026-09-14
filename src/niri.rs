@@ -6470,12 +6470,23 @@ impl Niri {
             }
 
             let mut windows = vec![];
+            let mut relayer = vec![];
             self.layout.with_windows_mut(|mapped, _| {
                 if mapped.recompute_window_rules(window_rules, self.is_at_startup) {
+                    if let Some(floating) = mapped
+                        .rules()
+                        .floating
+                        .filter(|floating| *floating != mapped.is_floating())
+                    {
+                        relayer.push((mapped.window.clone(), floating));
+                    }
                     windows.push(mapped.window.clone());
                 }
             });
             let changed = !windows.is_empty();
+            for (win, floating) in relayer {
+                self.layout.set_window_floating(Some(&win), floating);
+            }
             for win in windows {
                 self.layout.update_window(&win, None);
             }

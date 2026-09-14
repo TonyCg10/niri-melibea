@@ -36,6 +36,14 @@ pub struct WindowRule {
     pub open_focused: Option<bool>,
 
     // Rules applied dynamically.
+    /// Whether the window belongs in the floating layer.
+    ///
+    /// Unlike `open_floating`, this is resolved every time the rules are, so it still catches a
+    /// window that only becomes recognizable after it maps — one that opens under a generic
+    /// title and renames itself a moment later, say. The window moves layer when the answer
+    /// changes; leaving this unset keeps hands off, so a manual toggle stays put.
+    #[knuffel(child, unwrap(argument))]
+    pub floating: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub min_width: Option<u16>,
     #[knuffel(child, unwrap(argument))]

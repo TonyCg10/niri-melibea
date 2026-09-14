@@ -73,6 +73,10 @@ pub struct ResolvedWindowRules {
     /// Whether the window should open focused.
     pub open_focused: Option<bool>,
 
+    /// Whether the window belongs in the floating layer, resolved on every recompute rather
+    /// than only at open.
+    pub floating: Option<bool>,
+
     /// Extra bound on the minimum window width.
     pub min_width: Option<u16>,
     /// Extra bound on the minimum window height.
@@ -251,6 +255,10 @@ impl ResolvedWindowRules {
 
                 if let Some(x) = rule.open_floating {
                     resolved.open_floating = Some(x);
+                }
+
+                if let Some(x) = rule.floating {
+                    resolved.floating = Some(x);
                 }
 
                 if let Some(x) = rule.open_focused {
