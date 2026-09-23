@@ -34,6 +34,17 @@ pub struct WindowRule {
     pub open_floating: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub open_focused: Option<bool>,
+    /// How long to keep a new window off screen while it finishes saying what it is.
+    ///
+    /// Some windows only become recognizable after they map: a browser extension's popout maps
+    /// under the browser's generic title and renames itself a few frames later. Placed at once,
+    /// it lands in the strip under the rules for an ordinary browser window, and moves after.
+    ///
+    /// With this set, the window waits instead, drawn nowhere. It is placed as soon as its rules
+    /// change — the late title arriving — or when the time runs out, whichever comes first, so
+    /// it opens once, in the right place, at the right size.
+    #[knuffel(child, unwrap(argument))]
+    pub settle_ms: Option<u16>,
 
     // Rules applied dynamically.
     /// Whether the window belongs in the floating layer.
@@ -152,6 +163,20 @@ pub struct Match {
     /// distinguishes it from the first window except its title.
     #[knuffel(property)]
     pub is_transient: Option<bool>,
+    /// Whether the program that opened this window already had a window on screen when it did.
+    ///
+    /// This is the child-window test for programs that never declare a parent: a browser
+    /// extension's popout, most of Steam. They cannot hide which process asked for the window,
+    /// and a process asking for a second one is, far more often than not, asking for a dialog.
+    ///
+    /// It is decided once, when the window opens, and does not change after: closing the first
+    /// window does not turn the dialog into a main window.
+    ///
+    /// The cost is that a deliberate second main window — a new browser window, a second editor
+    /// window — is secondary too. Those are the exceptions to write down, and there are far
+    /// fewer of them than there are programs with dialogs.
+    #[knuffel(property)]
+    pub is_secondary: Option<bool>,
     #[knuffel(property)]
     pub at_startup: Option<bool>,
 }

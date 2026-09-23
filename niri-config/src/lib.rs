@@ -1815,6 +1815,7 @@ mod tests {
                             is_window_cast_target: None,
                             is_urgent: None,
                             is_transient: None,
+                            is_secondary: None,
                             at_startup: None,
                         },
                     ],
@@ -1835,6 +1836,7 @@ mod tests {
                             is_window_cast_target: None,
                             is_urgent: None,
                             is_transient: None,
+                            is_secondary: None,
                             at_startup: None,
                         },
                         Match {
@@ -1851,6 +1853,7 @@ mod tests {
                             is_window_cast_target: None,
                             is_urgent: None,
                             is_transient: None,
+                            is_secondary: None,
                             at_startup: None,
                         },
                     ],
@@ -1881,6 +1884,7 @@ mod tests {
                     open_focused: Some(
                         true,
                     ),
+                    settle_ms: None,
                     floating: None,
                     min_width: None,
                     min_height: None,

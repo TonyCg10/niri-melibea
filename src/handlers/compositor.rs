@@ -1,8 +1,10 @@
 use std::collections::hash_map::Entry;
+use std::time::{Duration, Instant};
 
 use niri_ipc::PositionChange;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -24,7 +26,7 @@ use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
 use crate::niri::{CastTarget, ClientState, LockState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{is_mapped, send_scale_transform};
-use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
+use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Settle, Unmapped};
 
 impl CompositorHandler for State {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -78,199 +80,26 @@ impl CompositorHandler for State {
 
         if surface == &root_surface {
             // This is a root surface commit. It might have mapped a previously-unmapped toplevel.
-            if let Entry::Occupied(entry) = self.niri.unmapped_windows.entry(surface.clone()) {
+            if let Entry::Occupied(mut entry) = self.niri.unmapped_windows.entry(surface.clone()) {
                 if is_mapped(surface) {
                     // The toplevel got mapped.
-                    let Unmapped {
-                        window,
-                        state,
-                        activation_token_data,
-                    } = entry.remove();
-
-                    window.on_commit();
-
-                    let toplevel = window.toplevel().expect("no X11 support");
-
-                    let (
-                        rules,
-                        width,
-                        height,
-                        is_full_width,
-                        output,
-                        workspace_id,
-                        is_pending_maximized,
-                    ) = if let InitialConfigureState::Configured {
-                        rules,
-                        width,
-                        height,
-                        floating_width: _,
-                        floating_height: _,
-                        is_full_width,
-                        output,
-                        workspace_name,
-                        is_pending_maximized,
-                    } = state
-                    {
-                        // Check that the output is still connected.
-                        let output =
-                            output.filter(|o| self.niri.layout.monitor_for_output(o).is_some());
-
-                        // Check that the workspace still exists.
-                        let workspace_id = workspace_name
-                            .as_deref()
-                            .and_then(|n| self.niri.layout.find_workspace_by_name(n))
-                            .map(|(_, ws)| ws.id());
-
-                        (
-                            rules,
-                            width,
-                            height,
-                            is_full_width,
-                            output,
-                            workspace_id,
-                            is_pending_maximized,
-                        )
-                    } else {
-                        // Can happen when a surface unmaps by attaching a null buffer while
-                        // there are in-flight pending configures.
-                        debug!("window mapped without proper initial configure");
-                        (
-                            ResolvedWindowRules::default(),
-                            None,
-                            None,
-                            false,
-                            None,
-                            None,
-                            false,
-                        )
-                    };
-
-                    // The GTK about dialog sets min/max size after the initial configure but
-                    // before mapping, so we need to compute open_floating at the last possible
-                    // moment, that is here.
-                    let is_floating = rules.compute_open_floating(toplevel);
-
-                    // Figure out if we should activate the window.
-                    let activate = rules.open_focused.map(|focus| {
-                        if focus {
-                            ActivateWindow::Yes
-                        } else {
-                            ActivateWindow::No
-                        }
-                    });
-                    let activate = activate.unwrap_or_else(|| {
-                        // Check the token timestamp again in case the window took a while between
-                        // requesting activation and mapping.
-                        let token = activation_token_data.filter(|token| {
-                            token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
-                        });
-                        if token.is_some() {
-                            ActivateWindow::Yes
-                        } else {
-                            let config = self.niri.config.borrow();
-                            if config.debug.strict_new_window_focus_policy {
-                                ActivateWindow::No
-                            } else {
-                                ActivateWindow::Smart
-                            }
-                        }
-                    });
-
-                    let parent = toplevel
-                        .parent()
-                        .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
-                        // Only consider the parent if we configured the window for the same
-                        // output.
-                        //
-                        // Normally when we're following the parent, the configured output will be
-                        // None. If the configured output is set, that means it was set explicitly
-                        // by a window rule or a fullscreen request.
-                        .filter(|(_, parent_output)| {
-                            parent_output.is_none()
-                                || output.is_none()
-                                || output.as_ref() == *parent_output
-                        })
-                        .map(|(mapped, _)| mapped.window.clone());
-                    let parent_is_minimized = parent
-                        .as_ref()
-                        .is_some_and(|parent| self.niri.layout.is_minimized(parent));
-
-                    // The mapped pre-commit hook deals with dma-bufs on its own.
-                    self.remove_default_dmabuf_pre_commit_hook(surface);
-                    let hook = add_mapped_toplevel_pre_commit_hook(toplevel);
-                    let mapped = {
-                        let config = self.niri.config.borrow();
-                        Mapped::new(window, rules, hook, &config)
-                    };
-                    let window = mapped.window.clone();
-
-                    let activate = if parent_is_minimized {
-                        ActivateWindow::No
-                    } else {
-                        activate
-                    };
-                    let target = if parent_is_minimized {
-                        // A minimized parent has no visible workspace, so
-                        // NextTo would be invalid. Add synchronously and retain
-                        // the child before this commit can be rendered.
-                        AddWindowTarget::Auto
-                    } else if let Some(p) = &parent {
-                        // Open dialogs next to their parent window.
-                        AddWindowTarget::NextTo(p)
-                    } else if let Some(id) = workspace_id {
-                        AddWindowTarget::Workspace(id)
-                    } else if let Some(output) = &output {
-                        AddWindowTarget::Output(output)
-                    } else {
-                        AddWindowTarget::Auto
-                    };
-                    let output = self.niri.layout.add_window(
-                        mapped,
-                        target,
-                        width,
-                        height,
-                        is_full_width,
-                        is_floating,
-                        activate,
-                    );
-                    let mut output = output.cloned();
-                    if parent_is_minimized {
-                        let attached = parent.as_ref().is_some_and(|parent| {
-                            self.niri
-                                .layout
-                                .reconcile_minimized_parent(&window, Some(parent))
-                        });
-                        if attached {
-                            output = None;
-                        } else {
-                            error!("could not attach new transient to minimized parent family");
-                        }
+                    if self.hold_until_settled(surface) {
+                        return;
                     }
+                    let Some(unmapped) = self.niri.unmapped_windows.remove(surface) else {
+                        return;
+                    };
+                    self.map_toplevel(surface, unmapped);
+                    return;
+                }
 
-                    // The window state cannot contain Fullscreen and Maximized at once. Therefore,
-                    // if the window ended up fullscreen, then we only know that it is also
-                    // maximized from the is_pending_maximized variable. Tell the layout about it
-                    // here so that unfullscreening the window makes it maximized.
-                    if let Some((mapped, _)) = self.niri.layout.find_window_and_output(surface) {
-                        if mapped.pending_sizing_mode().is_fullscreen() && is_pending_maximized {
-                            self.niri.layout.set_maximized(&window, true);
-                        }
-                    } else {
-                        error!("layout is missing the window that we just added");
-                    }
-
-                    if let Some(output) = output {
-                        self.niri.layout.start_open_animation_for_window(&window);
-
-                        let new_focus = self.niri.layout.focus().map(|m| &m.window);
-                        if new_focus == Some(&window) {
-                            // We activated the newly opened window.
-                            self.maybe_warp_cursor_to_focus();
-                            self.niri.layer_shell_on_demand_focus = None;
-                        }
-
-                        self.niri.queue_redraw(&output);
-                    }
+                // A held window that drops its buffer has unmapped as far as its client knows,
+                // even though niri never showed it, and the client now goes through the initial
+                // commit and configure again. Start it over so it gets that configure.
+                if matches!(entry.get().settle, Settle::Holding { .. }) {
+                    trace!("held toplevel dropped its buffer");
+                    let window = entry.get().window.clone();
+                    entry.insert(Unmapped::new(window));
                     return;
                 }
 
@@ -545,6 +374,259 @@ impl BufferHandler for State {
 impl ShmHandler for State {
     fn shm_state(&self) -> &ShmState {
         &self.niri.shm_state
+    }
+}
+
+impl State {
+    /// Whether to keep a window that has a buffer off screen for now.
+    ///
+    /// A window whose rules ask for it is held until they change or its deadline passes, and
+    /// placed then, with the rules it has by that point.
+    fn hold_until_settled(&mut self, surface: &WlSurface) -> bool {
+        let Some(unmapped) = self.niri.unmapped_windows.get_mut(surface) else {
+            return false;
+        };
+
+        match unmapped.settle {
+            Settle::Holding { .. } => true,
+            Settle::No => {
+                let InitialConfigureState::Configured { rules, .. } = &unmapped.state else {
+                    return false;
+                };
+                let Some(ms) = rules.settle_ms.filter(|ms| *ms > 0) else {
+                    return false;
+                };
+
+                let wait = Duration::from_millis(u64::from(ms));
+                let deadline = Instant::now() + wait;
+                unmapped.settle = Settle::Holding { deadline };
+
+                debug!(surface = %surface.id(), ms, "holding a new window until its rules settle");
+                let surface = surface.clone();
+                self.niri
+                    .event_loop
+                    .insert_source(Timer::from_duration(wait), move |_, _, state| {
+                        state.release_settled_window(&surface, deadline);
+                        TimeoutAction::Drop
+                    })
+                    .unwrap();
+                true
+            }
+        }
+    }
+
+    /// Places a held window whose time is up, with whatever rules it has by now.
+    ///
+    /// Nothing happens if the window is gone, already placed, or held again since this timer
+    /// was set: its deadline is how the timer knows it is still the one in charge.
+    pub fn release_settled_window(&mut self, surface: &WlSurface, deadline: Instant) {
+        let Some(unmapped) = self.niri.unmapped_windows.get(surface) else {
+            return;
+        };
+        if !matches!(unmapped.settle, Settle::Holding { deadline: d } if d == deadline) {
+            return;
+        }
+
+        debug!(surface = %surface.id(), "placing a held window: its time is up");
+        self.place_held_window(surface);
+    }
+
+    /// Places a held window now, with the rules it has.
+    ///
+    /// A window still held always has its buffer, since dropping it starts the window over.
+    pub fn place_held_window(&mut self, surface: &WlSurface) {
+        let Some(unmapped) = self.niri.unmapped_windows.remove(surface) else {
+            return;
+        };
+        self.map_toplevel(surface, unmapped);
+    }
+
+    /// Places a toplevel that has its first buffer: rules, layer, output, focus, animation.
+    ///
+    /// Called from the commit that brought the buffer, or later, for a window that was held
+    /// back to let its rules settle.
+    fn map_toplevel(&mut self, surface: &WlSurface, unmapped: Unmapped) {
+        let Unmapped {
+            window,
+            state,
+            activation_token_data,
+            is_secondary,
+            settle: _,
+        } = unmapped;
+
+        window.on_commit();
+
+        let toplevel = window.toplevel().expect("no X11 support");
+
+        let (rules, width, height, is_full_width, output, workspace_id, is_pending_maximized) =
+            if let InitialConfigureState::Configured {
+                rules,
+                width,
+                height,
+                floating_width: _,
+                floating_height: _,
+                is_full_width,
+                output,
+                workspace_name,
+                is_pending_maximized,
+            } = state
+            {
+                // Check that the output is still connected.
+                let output = output.filter(|o| self.niri.layout.monitor_for_output(o).is_some());
+
+                // Check that the workspace still exists.
+                let workspace_id = workspace_name
+                    .as_deref()
+                    .and_then(|n| self.niri.layout.find_workspace_by_name(n))
+                    .map(|(_, ws)| ws.id());
+
+                (
+                    rules,
+                    width,
+                    height,
+                    is_full_width,
+                    output,
+                    workspace_id,
+                    is_pending_maximized,
+                )
+            } else {
+                // Can happen when a surface unmaps by attaching a null buffer while
+                // there are in-flight pending configures.
+                debug!("window mapped without proper initial configure");
+                (
+                    ResolvedWindowRules::default(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                )
+            };
+
+        // The GTK about dialog sets min/max size after the initial configure but
+        // before mapping, so we need to compute open_floating at the last possible
+        // moment, that is here.
+        let is_floating = rules.compute_open_floating(toplevel);
+
+        // Figure out if we should activate the window.
+        let activate = rules.open_focused.map(|focus| {
+            if focus {
+                ActivateWindow::Yes
+            } else {
+                ActivateWindow::No
+            }
+        });
+        let activate = activate.unwrap_or_else(|| {
+            // Check the token timestamp again in case the window took a while between
+            // requesting activation and mapping.
+            let token = activation_token_data
+                .filter(|token| token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT);
+            if token.is_some() {
+                ActivateWindow::Yes
+            } else {
+                let config = self.niri.config.borrow();
+                if config.debug.strict_new_window_focus_policy {
+                    ActivateWindow::No
+                } else {
+                    ActivateWindow::Smart
+                }
+            }
+        });
+
+        let parent = toplevel
+            .parent()
+            .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
+            // Only consider the parent if we configured the window for the same
+            // output.
+            //
+            // Normally when we're following the parent, the configured output will be
+            // None. If the configured output is set, that means it was set explicitly
+            // by a window rule or a fullscreen request.
+            .filter(|(_, parent_output)| {
+                parent_output.is_none() || output.is_none() || output.as_ref() == *parent_output
+            })
+            .map(|(mapped, _)| mapped.window.clone());
+        let parent_is_minimized = parent
+            .as_ref()
+            .is_some_and(|parent| self.niri.layout.is_minimized(parent));
+
+        // The mapped pre-commit hook deals with dma-bufs on its own.
+        self.remove_default_dmabuf_pre_commit_hook(surface);
+        let hook = add_mapped_toplevel_pre_commit_hook(toplevel);
+        let mapped = {
+            let config = self.niri.config.borrow();
+            Mapped::new(window, rules, is_secondary, hook, &config)
+        };
+        let window = mapped.window.clone();
+
+        let activate = if parent_is_minimized {
+            ActivateWindow::No
+        } else {
+            activate
+        };
+        let target = if parent_is_minimized {
+            // A minimized parent has no visible workspace, so
+            // NextTo would be invalid. Add synchronously and retain
+            // the child before this commit can be rendered.
+            AddWindowTarget::Auto
+        } else if let Some(p) = &parent {
+            // Open dialogs next to their parent window.
+            AddWindowTarget::NextTo(p)
+        } else if let Some(id) = workspace_id {
+            AddWindowTarget::Workspace(id)
+        } else if let Some(output) = &output {
+            AddWindowTarget::Output(output)
+        } else {
+            AddWindowTarget::Auto
+        };
+        let output = self.niri.layout.add_window(
+            mapped,
+            target,
+            width,
+            height,
+            is_full_width,
+            is_floating,
+            activate,
+        );
+        let mut output = output.cloned();
+        if parent_is_minimized {
+            let attached = parent.as_ref().is_some_and(|parent| {
+                self.niri
+                    .layout
+                    .reconcile_minimized_parent(&window, Some(parent))
+            });
+            if attached {
+                output = None;
+            } else {
+                error!("could not attach new transient to minimized parent family");
+            }
+        }
+
+        // The window state cannot contain Fullscreen and Maximized at once. Therefore,
+        // if the window ended up fullscreen, then we only know that it is also
+        // maximized from the is_pending_maximized variable. Tell the layout about it
+        // here so that unfullscreening the window makes it maximized.
+        if let Some((mapped, _)) = self.niri.layout.find_window_and_output(surface) {
+            if mapped.pending_sizing_mode().is_fullscreen() && is_pending_maximized {
+                self.niri.layout.set_maximized(&window, true);
+            }
+        } else {
+            error!("layout is missing the window that we just added");
+        }
+
+        if let Some(output) = output {
+            self.niri.layout.start_open_animation_for_window(&window);
+
+            let new_focus = self.niri.layout.focus().map(|m| &m.window);
+            if new_focus == Some(&window) {
+                // We activated the newly opened window.
+                self.maybe_warp_cursor_to_focus();
+                self.niri.layer_shell_on_demand_focus = None;
+            }
+
+            self.niri.queue_redraw(&output);
+        }
     }
 }
 

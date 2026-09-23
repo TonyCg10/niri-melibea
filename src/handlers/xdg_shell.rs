@@ -45,9 +45,10 @@ use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
-    get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
+    get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state,
+    with_toplevel_role, ResizeEdge,
 };
-use crate::window::{InitialConfigureState, ResolvedWindowRules, Unmapped, WindowRef};
+use crate::window::{InitialConfigureState, ResolvedWindowRules, Settle, Unmapped, WindowRef};
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -902,6 +903,10 @@ impl XdgShellHandler for State {
     }
 
     fn parent_changed(&mut self, toplevel: ToplevelSurface) {
+        // `is-transient` reads the parent, so a parent named after the initial configure changes
+        // the rules the same way a late title does.
+        self.update_window_rules(&toplevel);
+
         let child = self
             .niri
             .layout
@@ -1050,10 +1055,27 @@ impl State {
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
 
+        // "The same program" is the connection plus the app id. The connection alone is not
+        // enough: every X11 program shares xwayland-satellite's one connection, and only the
+        // app id the satellite takes from WM_CLASS still tells them apart.
+        let program = |toplevel: &ToplevelSurface| {
+            let client = toplevel.wl_surface().client().map(|client| client.id());
+            let app_id = with_toplevel_role(toplevel, |role| role.app_id.clone());
+            client.map(|client| (client, app_id))
+        };
+        let this_program = program(toplevel);
+        let is_secondary = this_program.is_some()
+            && self
+                .niri
+                .layout
+                .windows()
+                .any(|(_, mapped)| program(mapped.toplevel()) == this_program);
+
         let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
         };
+        unmapped.is_secondary = is_secondary;
 
         let config = self.niri.config.borrow();
         let rules = ResolvedWindowRules::compute(
@@ -1167,19 +1189,33 @@ impl State {
             height = ws.resolve_default_height(rules.default_height, false);
             floating_height = ws.resolve_default_height(rules.default_height, true);
 
-            let configure_width = if is_floating {
+            // A window that will be held until its rules settle is asked for the size it wants
+            // rather than for a tile's: which layer it belongs in is exactly what is not known
+            // yet. Once a client has drawn itself at a tile's size, telling it to choose its own
+            // size again does not bring back the one it would have chosen — GTK, for one, keeps
+            // what it has — so a window that turned out to be a dialog would float at a tile's
+            // size. Going the other way costs nothing visible: a window that turns out to tile
+            // is resized into its column as it opens, as any client that picked its own size is.
+            let is_held = rules.settle_ms.is_some_and(|ms| ms > 0);
+            let configure_as_floating = is_floating || is_held;
+
+            let configure_width = if configure_as_floating {
                 floating_width
             } else if is_full_width {
                 Some(PresetSize::Proportion(1.))
             } else {
                 width
             };
-            let configure_height = if is_floating { floating_height } else { height };
+            let configure_height = if configure_as_floating {
+                floating_height
+            } else {
+                height
+            };
             ws.configure_new_window(
                 window,
                 configure_width,
                 configure_height,
-                is_floating,
+                configure_as_floating,
                 &rules,
             );
         }
@@ -1397,8 +1433,21 @@ impl State {
                 WindowRef::Unmapped(unmapped),
                 self.niri.is_at_startup,
             );
+            let mut changed_while_held = false;
             if let InitialConfigureState::Configured { rules, .. } = &mut unmapped.state {
+                changed_while_held =
+                    *rules != new_rules && matches!(unmapped.settle, Settle::Holding { .. });
                 *rules = new_rules;
+            }
+
+            // This is what a held window was waiting for.
+            if changed_while_held {
+                drop(config);
+                debug!(
+                    surface = %toplevel.wl_surface().id(),
+                    "placing a held window: its rules changed"
+                );
+                self.place_held_window(toplevel.wl_surface());
             }
         } else if let Some((mapped, output)) = self
             .niri

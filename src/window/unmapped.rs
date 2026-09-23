@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use niri_config::PresetSize;
 use smithay::desktop::Window;
 use smithay::output::Output;
@@ -12,6 +14,23 @@ pub struct Unmapped {
     pub state: InitialConfigureState,
     /// Activation token, if one was used on this unmapped window.
     pub activation_token_data: Option<XdgActivationTokenData>,
+    /// Whether the program asking for this window already had one on screen.
+    ///
+    /// Settled at the initial configure, which is the first moment rules are resolved, and
+    /// carried into the mapped window unchanged.
+    pub is_secondary: bool,
+    /// Whether this window is being kept off screen until its rules settle.
+    pub settle: Settle,
+}
+
+/// Where a new window stands in waiting for its rules to settle before it is placed.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum Settle {
+    /// Not held: placed as soon as it has a buffer.
+    #[default]
+    No,
+    /// Held off screen until its rules change or `deadline` passes, whichever comes first.
+    Holding { deadline: Instant },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -87,6 +106,8 @@ impl Unmapped {
                 wants_maximized: false,
             },
             activation_token_data: None,
+            is_secondary: false,
+            settle: Settle::No,
         }
     }
 

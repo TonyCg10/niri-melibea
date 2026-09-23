@@ -20,7 +20,7 @@ pub mod mapped;
 pub use mapped::Mapped;
 
 pub mod unmapped;
-pub use unmapped::{InitialConfigureState, Unmapped};
+pub use unmapped::{InitialConfigureState, Settle, Unmapped};
 
 /// Reference to a mapped or unmapped window.
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +72,9 @@ pub struct ResolvedWindowRules {
 
     /// Whether the window should open focused.
     pub open_focused: Option<bool>,
+
+    /// How long to hold a new window unplaced while its rules may still change.
+    pub settle_ms: Option<u16>,
 
     /// Whether the window belongs in the floating layer, resolved on every recompute rather
     /// than only at open.
@@ -175,6 +178,13 @@ impl<'a> WindowRef<'a> {
         }
     }
 
+    pub fn is_secondary(self) -> bool {
+        match self {
+            WindowRef::Unmapped(unmapped) => unmapped.is_secondary,
+            WindowRef::Mapped(mapped) => mapped.is_secondary(),
+        }
+    }
+
     pub fn is_window_cast_target(self) -> bool {
         match self {
             WindowRef::Unmapped(_) => false,
@@ -263,6 +273,10 @@ impl ResolvedWindowRules {
 
                 if let Some(x) = rule.open_focused {
                     resolved.open_focused = Some(x);
+                }
+
+                if let Some(x) = rule.settle_ms {
+                    resolved.settle_ms = Some(x);
                 }
 
                 if let Some(x) = rule.min_width {
@@ -412,6 +426,12 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
     // before the window maps, which is when the rule that decides floating is resolved.
     if let Some(is_transient) = m.is_transient {
         if role.parent.is_some() != is_transient {
+            return false;
+        }
+    }
+
+    if let Some(is_secondary) = m.is_secondary {
+        if window.is_secondary() != is_secondary {
             return false;
         }
     }

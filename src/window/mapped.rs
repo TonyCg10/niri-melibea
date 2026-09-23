@@ -100,6 +100,11 @@ pub struct Mapped {
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
 
+    /// Whether the program that opened this window already had one on screen at the time.
+    ///
+    /// Fixed at open: the dialog stays a dialog after the window it belonged to closes.
+    is_secondary: bool,
+
     /// Whether this window should ignore opacity set through window rules.
     ignore_opacity_window_rule: bool,
 
@@ -272,7 +277,13 @@ enum RequestSizeOnce {
 }
 
 impl Mapped {
-    pub fn new(window: Window, rules: ResolvedWindowRules, hook: HookId, config: &Config) -> Self {
+    pub fn new(
+        window: Window,
+        rules: ResolvedWindowRules,
+        is_secondary: bool,
+        hook: HookId,
+        config: &Config,
+    ) -> Self {
         let surface = window.wl_surface().expect("no X11 support");
         let credentials = get_credentials_for_surface(&surface);
         let mut rv = Self {
@@ -290,6 +301,7 @@ impl Mapped {
             is_active_in_column: true,
             is_floating: false,
             is_window_cast_target: false,
+            is_secondary,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
             blur_config: config.blur,
@@ -381,6 +393,10 @@ impl Mapped {
 
     pub fn is_window_cast_target(&self) -> bool {
         self.is_window_cast_target
+    }
+
+    pub fn is_secondary(&self) -> bool {
+        self.is_secondary
     }
 
     pub fn toggle_ignore_opacity_window_rule(&mut self) {
