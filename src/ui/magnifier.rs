@@ -7,13 +7,14 @@
 //! the finished picture, so magnifying is a transform rather than a copy.
 //!
 //! The output's elements are rendered once into an offscreen texture and that single texture
-//! is scaled about the pointer. Scaling each element separately is not an option — the render
+//! is scaled up. Scaling each element separately is not an option — the render
 //! element type would have to contain itself — and this way the picture magnifies whole:
 //! windows, panels and cursor alike, which is the point. A magnifier that left the shell's own
 //! bar at its original size would be no use to the person who needed it.
 //!
-//! The pointer stays under the same spot on the glass as the world grows around it, which is
-//! how a magnifying glass behaves and means the mouse never jumps when zooming.
+//! What is shown is a window of the output centred on the pointer and clamped to the output's
+//! edges, so the corners can always be brought into view. The cost is that near an edge the
+//! pointer is no longer at the centre of the picture; see `Magnifier::magnify`.
 
 use anyhow::Context as _;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
@@ -115,10 +116,6 @@ impl Magnifier {
         self.anim.as_ref().is_some_and(|anim| !anim.is_done())
     }
 
-    /// Renders `elements` into a texture and returns it scaled about `origin`.
-    ///
-    /// `origin` is the pointer in output-local logical coordinates: the one point that must not
-    /// move while the picture grows around it.
     /// Renders `elements` into a texture and returns the magnified view of them.
     ///
     /// The view is a window of the output, `level` times smaller than the output itself,
