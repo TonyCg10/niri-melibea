@@ -4,6 +4,7 @@ use std::rc::Rc;
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
+use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
@@ -135,7 +136,7 @@ pub struct Tile<W: LayoutElement> {
 }
 
 niri_render_elements! {
-    TileRenderElement<R> => {
+    TileInnerRenderElement<R> => {
         LayoutElement = LayoutElementRenderElement<R>,
         FocusRing = FocusRingRenderElement,
         SolidColor = SolidColorRenderElement,
@@ -147,6 +148,15 @@ niri_render_elements! {
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
+    }
+}
+
+// A separate outer enum because the rescaled variant has to wrap the plain elements, and an enum
+// cannot hold a rescale of itself without boxing, which smithay's element traits don't cover.
+niri_render_elements! {
+    TileRenderElement<R> => {
+        Inner = TileInnerRenderElement<R>,
+        Rescaled = RescaleRenderElement<TileInnerRenderElement<R>>,
     }
 }
 
@@ -195,6 +205,9 @@ pub(super) struct AlphaAnimation {
 /// the only reading of "off" that can be animated at all. Colour is deliberately absent — it
 /// changes with the *active* state rather than with the rules, and blending two colours is a
 /// separate concern from this transition.
+///
+/// `scale` rides along so that a window shrinking as it loses focus does so at the same pace as
+/// it fades, rather than jumping to its new size while the opacity is still easing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct FocusValues {
     opacity: f64,
@@ -202,6 +215,7 @@ struct FocusValues {
     shadow_softness: f64,
     shadow_spread: f64,
     shadow_offset: Point<f64, Logical>,
+    scale: f64,
 }
 
 impl FocusValues {
@@ -212,6 +226,9 @@ impl FocusValues {
             shadow_softness: shadow.softness,
             shadow_spread: shadow.spread,
             shadow_offset: Point::from((shadow.offset.x.0, shadow.offset.y.0)),
+            // The floor keeps a tile from collapsing to nothing; the rule cannot ask for more
+            // than 1 because the tile's slot in the layout is all the room it has.
+            scale: rules.scale.unwrap_or(1.).clamp(0.01, 1.),
         }
     }
 
@@ -227,6 +244,7 @@ impl FocusValues {
                 mix(self.shadow_offset.x, to.shadow_offset.x),
                 mix(self.shadow_offset.y, to.shadow_offset.y),
             )),
+            scale: mix(self.scale, to.scale),
         }
     }
 }
@@ -562,7 +580,7 @@ impl<W: LayoutElement> Tile<W> {
                 .as_ref()
                 .is_some_and(|alpha| !alpha.anim.is_done())
             // Without this the transition stops being drawn partway: nothing else asks for a
-            // redraw while only opacity and shadow are still moving.
+            // redraw while only opacity, shadow and scale are still moving.
             || self
                 .focus_transition
                 .as_ref()
@@ -840,6 +858,20 @@ impl<W: LayoutElement> Tile<W> {
         } else {
             1.
         }
+    }
+
+    /// The factor this tile is drawn at about its centre, in `0.01..=1`.
+    ///
+    /// Only the drawing shrinks: the tile keeps its full slot in the layout, and input still goes
+    /// by that slot. The value comes through the focus transition so that a focus change eases the
+    /// size like it does the opacity, and gives way to 1 towards fullscreen for the same reason
+    /// opacity does: a fullscreen window is meant to cover the output.
+    pub(super) fn render_scale(&self) -> f64 {
+        let scale = self.current_focus_values().scale;
+
+        // Interpolate towards scale = 1. at fullscreen.
+        let p = self.fullscreen_progress();
+        scale * (1. - p) + 1. * p
     }
 
     /// Returns `None` if the border is hidden and `Some(width)` if it should be shown.
@@ -1165,7 +1197,7 @@ impl<W: LayoutElement> Tile<W> {
         location: Point<f64, Logical>,
         mut xray_pos: XrayPos,
         focus_ring: bool,
-        push: &mut dyn FnMut(TileRenderElement<R>),
+        push: &mut dyn FnMut(TileInnerRenderElement<R>),
     ) {
         let _span = tracy_client::span!("Tile::render_inner");
 
@@ -1471,6 +1503,42 @@ impl<W: LayoutElement> Tile<W> {
             .as_ref()
             .map_or(1., |alpha| alpha.anim.clamped_value()) as f32;
 
+        // The scale rule shrinks the tile about its centre by rescaling each element on the way
+        // out, rather than drawing the tile offscreen and shrinking the result. An unfocused tile
+        // stays small for as long as it is unfocused, so an offscreen would be an extra texture
+        // and pass per such tile every frame, and non-xray blur, which samples the framebuffer it
+        // is drawn into, would only find the empty offscreen behind the window. When the tile
+        // does go offscreen for the open or alpha animation, that one element is what shrinks.
+        //
+        // The bob offset is part of the centre so that a bobbing tile shrinks about where it is
+        // drawn rather than pulling the bob in.
+        let render_scale = self.render_scale();
+        let centre = self.bob_offset() + self.animated_tile_size().downscale(2.).to_point();
+        let rescale_origin =
+            (render_scale < 1.).then(|| (location + centre).to_physical_precise_round(scale));
+
+        // Xray samples the backdrop at the position and zoom it is given rather than at where its
+        // element ends up, so it must be told about the shrink too, or the backdrop seen through a
+        // small tile would be the one behind its full-size slot, squeezed in.
+        let xray_pos = if rescale_origin.is_some() {
+            let shift = centre.upscale(1. - render_scale);
+            XrayPos::new(
+                (xray_pos.pos_in_backdrop + shift).upscale(xray_pos.zoom),
+                xray_pos.zoom * render_scale,
+            )
+        } else {
+            xray_pos
+        };
+
+        let mut push = |elem: TileInnerRenderElement<R>| {
+            push(match rescale_origin {
+                Some(origin) => {
+                    RescaleRenderElement::from_element(elem, origin, render_scale).into()
+                }
+                None => elem.into(),
+            })
+        };
+
         let mut pushed = false;
         self.window().set_offscreen_data(None);
 
@@ -1527,7 +1595,7 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         if !pushed {
-            self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| push(elem));
+            self.render_inner(ctx, location, xray_pos, focus_ring, &mut push);
         }
     }
 
@@ -1694,5 +1762,28 @@ impl<W: LayoutElement> Tile<W> {
         let rounded = size.to_physical_precise_round(scale).to_logical(scale);
         assert_abs_diff_eq!(size.w, rounded.w, epsilon = 1e-5);
         assert_abs_diff_eq!(size.h, rounded.h, epsilon = 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_values_lerp_carries_scale() {
+        let values = |opacity, scale| FocusValues {
+            opacity,
+            shadow_alpha: 1.,
+            shadow_softness: 30.,
+            shadow_spread: 5.,
+            shadow_offset: Point::from((0., 5.)),
+            scale,
+        };
+        let from = values(1., 1.);
+        let to = values(0.5, 0.75);
+
+        assert_eq!(from.lerp(to, 0.), from);
+        assert_eq!(from.lerp(to, 0.5), values(0.75, 0.875));
+        assert_eq!(from.lerp(to, 1.), to);
     }
 }

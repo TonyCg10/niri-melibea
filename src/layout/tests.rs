@@ -4580,3 +4580,34 @@ fn a_transition_never_changes_authoritative_minimized_state() {
         layout.verify_invariants();
     }
 }
+
+#[test]
+fn render_scale_follows_scale_rule() {
+    let tile_with = |scale: Option<f64>, sizing_mode: SizingMode| {
+        let window = TestWindow::new(TestWindowParams {
+            rules: Some(ResolvedWindowRules {
+                scale,
+                ..ResolvedWindowRules::default()
+            }),
+            ..TestWindowParams::new(1)
+        });
+        window.0.sizing_mode.set(sizing_mode);
+        Tile::new(
+            window,
+            Size::from((1920., 1080.)),
+            1.,
+            Clock::with_time(Duration::ZERO),
+            Rc::new(Options::default()),
+        )
+    };
+
+    assert_eq!(tile_with(Some(0.9), SizingMode::Normal).render_scale(), 0.9);
+    // A zero scale would make the tile vanish, which is what closing is for.
+    assert_eq!(tile_with(Some(0.), SizingMode::Normal).render_scale(), 0.01);
+    assert_eq!(tile_with(None, SizingMode::Normal).render_scale(), 1.);
+    // Fullscreen is meant to cover the output, so the rule gives way there like opacity does.
+    assert_eq!(
+        tile_with(Some(0.5), SizingMode::Fullscreen).render_scale(),
+        1.
+    );
+}
