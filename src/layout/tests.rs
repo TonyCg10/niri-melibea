@@ -40,7 +40,8 @@ struct TestWindowInner {
     is_pending_windowed_fullscreen: Cell<bool>,
     animate_next_configure: Cell<bool>,
     animation_snapshot: RefCell<Option<LayoutElementRenderSnapshot>>,
-    rules: ResolvedWindowRules,
+    // Leaked so that rules() can keep handing out a plain reference while tests swap the rules.
+    rules: Cell<&'static ResolvedWindowRules>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,8 +93,12 @@ impl TestWindow {
             is_pending_windowed_fullscreen: Cell::new(false),
             animate_next_configure: Cell::new(false),
             animation_snapshot: RefCell::new(None),
-            rules: params.rules.unwrap_or_default(),
+            rules: Cell::new(Box::leak(Box::new(params.rules.unwrap_or_default()))),
         }))
+    }
+
+    fn set_rules(&self, rules: ResolvedWindowRules) {
+        self.0.rules.set(Box::leak(Box::new(rules)));
     }
 
     fn communicate(&self) -> bool {
@@ -262,7 +267,7 @@ impl LayoutElement for TestWindow {
     fn refresh(&self) {}
 
     fn rules(&self) -> &ResolvedWindowRules {
-        &self.0.rules
+        self.0.rules.get()
     }
 
     fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot> {

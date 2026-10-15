@@ -1097,3 +1097,83 @@ fn width_resize_and_cancel_of_column_to_the_left() {
     200 × 200 at x:100 y:  0
     ");
 }
+
+#[test]
+fn window_scale_follows_focus_rule_through_transition() {
+    const LINEAR: Kind = Kind::Easing(EasingParams {
+        duration_ms: 1000,
+        curve: Curve::Linear,
+    });
+
+    let set_up = || {
+        let mut options = make_options();
+        options.animations.window_focus_change.0.kind = LINEAR;
+
+        check_ops_with_options(
+            options,
+            [
+                Op::AddOutput(1),
+                Op::AddWindow {
+                    params: TestWindowParams::new(1),
+                },
+                Op::Communicate(1),
+                Op::CompleteAnimations,
+            ],
+        )
+    };
+
+    let scale = |layout: &Layout<TestWindow>| {
+        let ws = layout.active_workspace().unwrap();
+        ws.tiles()
+            .find(|tile| tile.window().id() == &1)
+            .unwrap()
+            .render_scale()
+    };
+    let set_scale = |layout: &mut Layout<TestWindow>, scale: Option<f64>| {
+        let window = layout
+            .active_workspace()
+            .unwrap()
+            .tiles()
+            .find_map(|tile| (tile.window().id() == &1).then(|| tile.window().clone()))
+            .unwrap();
+        window.set_rules(ResolvedWindowRules {
+            scale,
+            ..ResolvedWindowRules::default()
+        });
+        layout.update_window(&1, None);
+    };
+    #[track_caller]
+    fn assert_scale(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "scale is {actual}, expected {expected}"
+        );
+    }
+
+    // Left alone, the scale glides to the rule's value.
+    let mut layout = set_up();
+    assert_scale(scale(&layout), 1.);
+
+    // The rule changes, but the transition starts from what is on screen, so nothing jumps.
+    set_scale(&mut layout, Some(0.5));
+    assert_scale(scale(&layout), 1.);
+
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert_scale(scale(&layout), 0.75);
+
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert_scale(scale(&layout), 0.5);
+
+    // Interrupted half-way, the new transition starts from the on-screen scale rather than from
+    // the old start or the old target.
+    let mut layout = set_up();
+    set_scale(&mut layout, Some(0.5));
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert_scale(scale(&layout), 0.75);
+
+    set_scale(&mut layout, None);
+    assert_scale(scale(&layout), 0.75);
+
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert_scale(scale(&layout), 0.875);
+}
