@@ -1508,19 +1508,26 @@ impl<W: LayoutElement> Tile<W> {
         // stays small for as long as it is unfocused, so an offscreen would be an extra texture
         // and pass per such tile every frame, and non-xray blur, which samples the framebuffer it
         // is drawn into, would only find the empty offscreen behind the window. When the tile
-        // does go offscreen for the open or alpha animation, that one element is what shrinks.
+        // does go offscreen for the open or alpha animation, that one element is what shrinks,
+        // except for a window travelling out of a bubble: that one is already drawn about its own
+        // moving centre, so it applies the factor itself.
         //
         // The bob offset is part of the centre so that a bobbing tile shrinks about where it is
         // drawn rather than pulling the bob in.
         let render_scale = self.render_scale();
         let centre = self.bob_offset() + self.animated_tile_size().downscale(2.).to_point();
+        let shrinks = render_scale < 1.;
+        let travels = self
+            .open_animation
+            .as_ref()
+            .is_some_and(|open| open.travels());
         let rescale_origin =
-            (render_scale < 1.).then(|| (location + centre).to_physical_precise_round(scale));
+            (shrinks && !travels).then(|| (location + centre).to_physical_precise_round(scale));
 
         // Xray samples the backdrop at the position and zoom it is given rather than at where its
         // element ends up, so it must be told about the shrink too, or the backdrop seen through a
         // small tile would be the one behind its full-size slot, squeezed in.
-        let xray_pos = if rescale_origin.is_some() {
+        let xray_pos = if shrinks {
             let shift = centre.upscale(1. - render_scale);
             XrayPos::new(
                 (xray_pos.pos_in_backdrop + shift).upscale(xray_pos.zoom),
@@ -1559,6 +1566,7 @@ impl<W: LayoutElement> Tile<W> {
                 location,
                 scale,
                 tile_alpha,
+                render_scale,
             ) {
                 Ok((elem, data)) => {
                     self.window().set_offscreen_data(Some(data));

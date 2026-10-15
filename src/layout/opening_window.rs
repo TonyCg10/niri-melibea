@@ -56,8 +56,14 @@ impl OpenAnimation {
         self.anim.is_done()
     }
 
+    /// Whether the window grows out of a bubble elsewhere rather than appearing in place.
+    pub fn travels(&self) -> bool {
+        self.travel_from.is_some()
+    }
+
     // We can't depend on view_rect here, because the result of window opening can be snapshot and
     // then rendered elsewhere.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         renderer: &mut GlesRenderer,
@@ -66,6 +72,9 @@ impl OpenAnimation {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
+        // The scale rule's factor, which only the travelling path applies itself. See
+        // `travel_transform()`.
+        render_scale: f64,
     ) -> anyhow::Result<(OpeningWindowRenderElement, OffscreenData)> {
         let progress = self.anim.value();
         let clamped_progress = self.anim.clamped_value().clamp(0., 1.);
@@ -81,13 +90,8 @@ impl OpenAnimation {
             let elem = elem.with_alpha(clamped_progress as f32 * alpha);
 
             let center = geo_size.to_point().downscale(2.);
-            let end_center = location + center;
-            let start_center = origin.loc + origin.size.to_point().downscale(2.);
-            let current_center =
-                start_center + (end_center - start_center).upscale(clamped_progress);
-
-            let grow = f64::min(origin.size.w / geo_size.w, origin.size.h / geo_size.h);
-            let factor = (grow + (1. - grow) * clamped_progress).max(0.);
+            let (current_center, factor) =
+                travel_transform(origin, geo_size, location, clamped_progress, render_scale);
 
             let elem = RescaleRenderElement::from_element(
                 elem,
@@ -180,5 +184,84 @@ impl OpenAnimation {
         );
 
         Ok((elem.into(), data))
+    }
+}
+
+/// Where an anchored restore draws the tile at `progress`: the centre it is drawn about and the
+/// factor it is drawn at.
+///
+/// The factor runs from fitting the bubble to `render_scale` rather than to 1, so the window lands
+/// on exactly the size the scale rule draws it at once the animation is over. Shrinking the
+/// travelling window about its slot's centre from outside instead would pull the whole path
+/// towards the slot.
+fn travel_transform(
+    from: Rectangle<f64, Logical>,
+    geo_size: Size<f64, Logical>,
+    location: Point<f64, Logical>,
+    progress: f64,
+    render_scale: f64,
+) -> (Point<f64, Logical>, f64) {
+    let end_center = location + geo_size.to_point().downscale(2.);
+    let start_center = from.loc + from.size.to_point().downscale(2.);
+    let current_center = start_center + (end_center - start_center).upscale(progress);
+
+    let grow = f64::min(from.size.w / geo_size.w, from.size.h / geo_size.h);
+    let factor = (grow + (render_scale - grow) * progress).max(0.);
+
+    (current_center, factor)
+}
+
+#[cfg(test)]
+mod tests {
+    use approx::assert_abs_diff_eq;
+
+    use super::*;
+
+    /// The centre and size a tile of `geo_size` covers when drawn at `factor` about `center`.
+    fn drawn(
+        geo_size: Size<f64, Logical>,
+        (center, factor): (Point<f64, Logical>, f64),
+    ) -> (Point<f64, Logical>, Size<f64, Logical>) {
+        (center, geo_size.upscale(factor))
+    }
+
+    fn assert_close(
+        (center, size): (Point<f64, Logical>, Size<f64, Logical>),
+        expected: (Point<f64, Logical>, Size<f64, Logical>),
+        render_scale: f64,
+    ) {
+        let msg =
+            format!("render_scale: {render_scale}, got {center:?} {size:?}, want {expected:?}");
+        assert_abs_diff_eq!(center.x, expected.0.x, epsilon = 1e-9);
+        assert_abs_diff_eq!(center.y, expected.0.y, epsilon = 1e-9);
+        assert!((size.w - expected.1.w).abs() < 1e-9, "{msg}");
+        assert!((size.h - expected.1.h).abs() < 1e-9, "{msg}");
+    }
+
+    #[test]
+    fn travel_runs_from_the_bubble_to_the_shrunk_slot() {
+        let bubble = Rectangle::new(Point::new(1000., 900.), Size::from((40., 40.)));
+        let bubble_center = Point::new(1020., 920.);
+        let geo_size = Size::from((800., 400.));
+        let location = Point::new(100., 50.);
+        let slot_center = Point::new(500., 250.);
+
+        for render_scale in [1., 0.9, 0.5] {
+            let at = |progress| {
+                drawn(
+                    geo_size,
+                    travel_transform(bubble, geo_size, location, progress, render_scale),
+                )
+            };
+
+            // It starts over the bubble, fitted inside it.
+            let bubble_fit = Size::from((40., 20.));
+            assert_close(at(0.), (bubble_center, bubble_fit), render_scale);
+
+            // And ends where the tile is drawn once the animation is over: its slot, shrunk by
+            // the scale rule about the slot's centre.
+            let shrunk = geo_size.upscale(render_scale);
+            assert_close(at(1.), (slot_center, shrunk), render_scale);
+        }
     }
 }
