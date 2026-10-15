@@ -622,8 +622,9 @@ window-rule {
 
 <sup>Since: next release (melibea)</sup>
 
-Set the visual scale of the window, from `0.0` to `1.0`, with `1.0` being the default.
+Set the visual scale of the window, from `0.0` to `1.0`, with `1.0` being the default; values below `0.01` are drawn at `0.01`.
 The whole tile is drawn smaller about its centre, while its layout slot and pointer hit area stay the same size.
+Like opacity, the scale does not apply to fullscreen windows, which are always drawn at full size.
 
 The change is animated with the [`window-focus-change`](./Configuration:-Animations.md) animation.
 
