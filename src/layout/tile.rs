@@ -4,7 +4,6 @@ use std::rc::Rc;
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
-use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
@@ -25,6 +24,7 @@ use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, Rounde
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::rescale::SeamlessRescaleRenderElement;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
@@ -156,7 +156,7 @@ niri_render_elements! {
 niri_render_elements! {
     TileRenderElement<R> => {
         Inner = TileInnerRenderElement<R>,
-        Rescaled = RescaleRenderElement<TileInnerRenderElement<R>>,
+        Rescaled = SeamlessRescaleRenderElement<TileInnerRenderElement<R>>,
     }
 }
 
@@ -1533,7 +1533,7 @@ impl<W: LayoutElement> Tile<W> {
         let mut push = |elem: TileInnerRenderElement<R>| {
             push(match rescale_origin {
                 Some(origin) => {
-                    RescaleRenderElement::from_element(elem, origin, render_scale).into()
+                    SeamlessRescaleRenderElement::from_element(elem, origin, render_scale).into()
                 }
                 None => elem.into(),
             })
