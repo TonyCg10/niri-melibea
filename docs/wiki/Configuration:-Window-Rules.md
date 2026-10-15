@@ -52,6 +52,7 @@ window-rule {
     // Properties that apply continuously.
     draw-border-with-background false
     opacity 0.5
+    scale 0.9
     block-out-from "screencast"
     // block-out-from "screen-capture"
     variable-refresh-rate true
@@ -614,6 +615,25 @@ window-rule {
     match is-active=false
 
     opacity 0.95
+}
+```
+
+#### `scale`
+
+<sup>Since: next release (melibea)</sup>
+
+Set the visual scale of the window, from `0.0` to `1.0`, with `1.0` being the default.
+The whole tile is drawn smaller about its centre, while its layout slot and pointer hit area stay the same size.
+
+The change is animated with the [`window-focus-change`](./Configuration:-Animations.md) animation.
+
+```kdl
+// Shrink unfocused windows a little, for a 3D ribbon feel.
+window-rule {
+    match is-focused=false
+
+    opacity 0.75
+    scale 0.9
 }
 ```
 
