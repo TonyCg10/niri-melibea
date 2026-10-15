@@ -106,6 +106,9 @@ pub struct ResolvedWindowRules {
     /// Extra opacity to draw this window with.
     pub opacity: Option<f32>,
 
+    /// Visual scale to draw this window's tile with, about its centre.
+    pub scale: Option<f64>,
+
     /// Corner radius to assume this window has.
     pub geometry_corner_radius: Option<CornerRadius>,
 
@@ -302,6 +305,9 @@ impl ResolvedWindowRules {
                 }
                 if let Some(x) = rule.opacity {
                     resolved.opacity = Some(x);
+                }
+                if let Some(x) = rule.scale {
+                    resolved.scale = Some(x.0);
                 }
                 if let Some(x) = rule.geometry_corner_radius {
                     resolved.geometry_corner_radius = Some(x);

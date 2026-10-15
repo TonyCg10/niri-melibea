@@ -908,6 +908,7 @@ mod tests {
                 open-fullscreen false
                 open-floating false
                 open-focused true
+                scale 0.9
                 default-window-height { fixed 500; }
                 default-column-display "tabbed"
                 default-floating-position x=100 y=-200 relative-to="bottom-left"
@@ -1947,6 +1948,11 @@ mod tests {
                     },
                     draw_border_with_background: None,
                     opacity: None,
+                    scale: Some(
+                        FloatOrInt(
+                            0.9,
+                        ),
+                    ),
                     geometry_corner_radius: None,
                     clip_to_geometry: None,
                     baba_is_float: None,
@@ -2500,6 +2506,23 @@ mod tests {
             },
         }
         "#);
+    }
+
+    #[test]
+    fn window_rule_scale_out_of_range() {
+        let parse = |scale: &str| {
+            Config::parse_mem(&format!(
+                r#"window-rule {{
+                    scale {scale}
+                }}"#
+            ))
+        };
+
+        assert!(parse("0").is_ok());
+        assert!(parse("0.5").is_ok());
+        assert!(parse("1").is_ok());
+        assert!(parse("1.5").is_err());
+        assert!(parse("-0.1").is_err());
     }
 
     fn diff_lines(expected: &str, actual: &str) -> String {
