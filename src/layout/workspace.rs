@@ -1978,6 +1978,8 @@ impl<W: LayoutElement> Workspace<W> {
                 let pos_within_tile = pos - tile_pos;
 
                 if tile.hit(pos_within_tile).is_some() {
+                    // Measure the thirds on the tile as drawn, like the hit itself.
+                    let pos_within_tile = tile.undo_render_scale(pos_within_tile);
                     let size = tile.tile_size().to_f64();
 
                     let mut edges = ResizeEdge::empty();

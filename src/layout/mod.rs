@@ -577,7 +577,13 @@ pub enum AddWindowTarget<'a, W: LayoutElement> {
 pub enum HitType {
     /// The hit is within a window's input region and can be used for sending events to it.
     Input {
-        /// Position of the window's buffer.
+        /// Position to subtract from the hit point to get its position within the window's
+        /// buffer.
+        ///
+        /// For a tile drawn at full size this is the buffer's position. For a tile shrunk by
+        /// the scale rule it is the buffer's position shifted along with the point, because
+        /// the pointer focus only knows how to subtract: the shift is what makes the result
+        /// the point drawn under the pointer rather than the one the full-size slot would hold.
         win_pos: Point<f64, Logical>,
     },
     /// The hit can activate a window, but it is not in the input region so cannot send events.

@@ -33,6 +33,8 @@ struct TestWindowInner {
     forced_size: Cell<Option<Size<i32, Logical>>>,
     min_size: Size<i32, Logical>,
     max_size: Size<i32, Logical>,
+    // Whether the whole window accepts input; the default is a window that only activates.
+    has_input_region: bool,
     pending_sizing_mode: Cell<SizingMode>,
     pending_activated: Cell<bool>,
     sizing_mode: Cell<SizingMode>,
@@ -60,6 +62,8 @@ struct TestWindowParams {
     min_max_size: (Size<i32, Logical>, Size<i32, Logical>),
     #[proptest(strategy = "prop::option::of(arbitrary_rules())")]
     rules: Option<ResolvedWindowRules>,
+    #[proptest(value = "false")]
+    has_input_region: bool,
 }
 
 impl TestWindowParams {
@@ -71,6 +75,7 @@ impl TestWindowParams {
             bbox: Rectangle::from_size(Size::from((100, 200))),
             min_max_size: Default::default(),
             rules: None,
+            has_input_region: false,
         }
     }
 }
@@ -86,6 +91,7 @@ impl TestWindow {
             forced_size: Cell::new(None),
             min_size: params.min_max_size.0,
             max_size: params.min_max_size.1,
+            has_input_region: params.has_input_region,
             pending_sizing_mode: Cell::new(SizingMode::Normal),
             pending_activated: Cell::new(false),
             sizing_mode: Cell::new(SizingMode::Normal),
@@ -169,8 +175,8 @@ impl LayoutElement for TestWindow {
         (0, 0).into()
     }
 
-    fn is_in_input_region(&self, _point: Point<f64, Logical>) -> bool {
-        false
+    fn is_in_input_region(&self, point: Point<f64, Logical>) -> bool {
+        self.0.has_input_region && Rectangle::from_size(self.size().to_f64()).contains(point)
     }
 
     fn request_size(
@@ -4615,4 +4621,145 @@ fn render_scale_follows_scale_rule() {
         tile_with(Some(0.5), SizingMode::Fullscreen).render_scale(),
         1.
     );
+}
+
+/// A 100×200 tile whose whole window takes input, drawn at `scale` about its centre.
+fn input_tile_with_scale(scale: Option<f64>) -> Tile<TestWindow> {
+    let window = TestWindow::new(TestWindowParams {
+        rules: Some(ResolvedWindowRules {
+            scale,
+            ..ResolvedWindowRules::default()
+        }),
+        has_input_region: true,
+        ..TestWindowParams::new(1)
+    });
+    let tile = Tile::new(
+        window,
+        Size::from((1920., 1080.)),
+        1.,
+        Clock::with_time(Duration::ZERO),
+        Rc::new(Options::default()),
+    );
+    // The expectations below are written for a bare 100×200 window at the tile's origin.
+    assert_eq!(tile.tile_size(), Size::from((100., 200.)));
+    assert_eq!(tile.buf_loc(), Point::from((0., 0.)));
+    tile
+}
+
+/// Where a hit at `point` lands within the window, as the pointer focus will compute it.
+fn hit_pos_within_window(tile: &Tile<TestWindow>, point: (f64, f64)) -> Option<(f64, f64)> {
+    let point = Point::from(point);
+    match tile.hit(point)? {
+        HitType::Input { win_pos } => Some((point - win_pos).into()),
+        HitType::Activate { .. } => panic!("the whole window takes input"),
+    }
+}
+
+#[test]
+fn full_size_tile_hits_as_before() {
+    let tile = input_tile_with_scale(None);
+    let plain = HitType::Input {
+        win_pos: tile.buf_loc(),
+    };
+    for point in [(0., 0.), (0.5, 199.5), (50., 100.), (99.99, 0.01)] {
+        assert_eq!(tile.hit(Point::from(point)), Some(plain));
+    }
+    for point in [(-0.01, 10.), (100., 10.), (10., 200.), (150., 300.)] {
+        assert_eq!(tile.hit(Point::from(point)), None);
+    }
+}
+
+#[test]
+fn shrunk_tile_hits_what_is_drawn_under_the_point() {
+    // Drawn at 0.5 about (50, 100), the tile covers 25..75 × 50..150 of its slot.
+    let tile = input_tile_with_scale(Some(0.5));
+
+    // The centre stays put.
+    assert_eq!(hit_pos_within_window(&tile, (50., 100.)), Some((50., 100.)));
+    // A point a quarter of the way in from the drawn corner is drawn from halfway in.
+    assert_eq!(hit_pos_within_window(&tile, (30., 60.)), Some((10., 20.)));
+    assert_eq!(hit_pos_within_window(&tile, (70., 140.)), Some((90., 180.)));
+    // The drawn corners land on the window's corners.
+    assert_eq!(hit_pos_within_window(&tile, (25., 50.)), Some((0., 0.)));
+    assert_eq!(
+        hit_pos_within_window(&tile, (74.5, 149.5)),
+        Some((99., 199.))
+    );
+}
+
+#[test]
+fn shrunk_tile_misses_the_margin_around_its_drawing() {
+    let tile = input_tile_with_scale(Some(0.5));
+
+    // Inside the slot but outside the drawing: nothing is seen there, so nothing is hit.
+    for point in [
+        (0., 0.),
+        (24.9, 100.),
+        (50., 49.9),
+        (75., 100.),
+        (50., 150.),
+        (99., 199.),
+    ] {
+        assert_eq!(tile.hit(Point::from(point)), None, "point: {point:?}");
+    }
+}
+
+#[test]
+fn shrunk_tile_lets_the_window_beneath_take_its_margin() {
+    let floating = |id: usize, scale: Option<f64>| TestWindowParams {
+        is_floating: true,
+        has_input_region: true,
+        rules: Some(ResolvedWindowRules {
+            scale,
+            ..ResolvedWindowRules::default()
+        }),
+        ..TestWindowParams::new(id)
+    };
+    let at_origin = |id: usize| Op::MoveFloatingWindow {
+        id: Some(id),
+        x: PositionChange::SetFixed(0.),
+        y: PositionChange::SetFixed(0.),
+        animate: false,
+    };
+    let layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: floating(1, None),
+        },
+        Op::AddWindow {
+            params: floating(2, Some(0.5)),
+        },
+        at_origin(1),
+        at_origin(2),
+        Op::CompleteAnimations,
+    ]);
+
+    let output = layout.outputs().next().unwrap().clone();
+    let ws = layout.active_workspace().unwrap();
+    let mut tiles = ws.tiles_with_render_positions();
+    let (top, top_pos, _) = tiles.next().unwrap();
+    let (bottom, bottom_pos, _) = tiles.next().unwrap();
+    assert_eq!(
+        *top.window().id(),
+        2,
+        "the shrunk window must be the one on top"
+    );
+    assert_eq!(*bottom.window().id(), 1);
+    assert_eq!(top_pos, bottom_pos, "both windows share a slot");
+
+    let under = |point: (f64, f64)| {
+        let point = top_pos + Point::from(point);
+        layout
+            .window_under(&output, point)
+            .map(|(win, hit)| match hit {
+                HitType::Input { win_pos } => (*win.id(), <(f64, f64)>::from(point - win_pos)),
+                HitType::Activate { .. } => panic!("the whole window takes input"),
+            })
+    };
+
+    // Over the shrunk drawing, the top window gets the hit, at the point drawn there.
+    assert_eq!(under((30., 60.)), Some((2, (10., 20.))));
+    // In the margin the top window leaves bare, the bottom window shows through and is hit
+    // where it is, at full size.
+    assert_eq!(under((10., 20.)), Some((1, (10., 20.))));
 }

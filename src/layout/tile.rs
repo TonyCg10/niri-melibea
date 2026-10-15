@@ -1051,14 +1051,37 @@ impl<W: LayoutElement> Tile<W> {
         activation_region.contains(point)
     }
 
+    /// Maps a point in tile coordinates to where it falls in the tile as laid out, undoing the
+    /// scale the tile is drawn at.
+    ///
+    /// This is the inverse of what rendering does about the tile's centre, so that a point over
+    /// the shrunk drawing finds what is drawn there, and a point in the margin the drawing leaves
+    /// around itself falls outside the tile. At full size the point comes back as it is.
+    pub fn undo_render_scale(&self, point: Point<f64, Logical>) -> Point<f64, Logical> {
+        let scale = self.render_scale();
+        if scale >= 1. {
+            return point;
+        }
+
+        let centre = self.animated_tile_size().downscale(2.).to_point();
+        (point - centre).downscale(scale) + centre
+    }
+
     pub fn hit(&self, point: Point<f64, Logical>) -> Option<HitType> {
         let offset = self.bob_offset();
         let point = point - offset;
+        let as_laid_out = self.undo_render_scale(point);
 
-        if self.is_in_input_region(point) {
-            let win_pos = self.buf_loc() + offset;
+        if self.is_in_input_region(as_laid_out) {
+            let mut win_pos = self.buf_loc() + offset;
+            // The pointer focus can only subtract a position from the point, so for a shrunk
+            // tile the buffer's origin has to move with the point by what the unscaling moved
+            // it: then `point - win_pos` is where the hit falls within the buffer as drawn.
+            if as_laid_out != point {
+                win_pos += point - as_laid_out;
+            }
             Some(HitType::Input { win_pos })
-        } else if self.is_in_activation_region(point) {
+        } else if self.is_in_activation_region(as_laid_out) {
             Some(HitType::Activate {
                 is_tab_indicator: false,
             })
