@@ -1314,7 +1314,8 @@ impl<W: LayoutElement> Tile<W> {
             passes: suspend.blur_passes,
             offset: suspend.blur_offset,
         };
-        match self.suspended_snapshot.render(
+        // The snapshot logs its own failures, once each.
+        if let Some((elem, data)) = self.suspended_snapshot.render(
             ctx.renderer,
             scale,
             options,
@@ -1322,11 +1323,8 @@ impl<W: LayoutElement> Tile<W> {
             window_render_loc,
             win_alpha,
         ) {
-            Ok((elem, data)) => {
-                self.window.set_offscreen_data(Some(data));
-                push(elem.into());
-            }
-            Err(err) => warn!("error rendering suspended window: {err:?}"),
+            self.window.set_offscreen_data(Some(data));
+            push(elem.into());
         }
     }
 

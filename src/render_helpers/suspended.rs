@@ -3,8 +3,13 @@
 //! A suspended client is frozen and never commits, so the blurred texture is kept and reused
 //! until the window's offscreen damage or texture, its size, the output scale or the blur options
 //! change.
+//!
+//! A missing blur program is remembered until the renderer context changes, and each distinct
+//! failure is logged once per snapshot, so a persistent problem neither retries nor warns every
+//! frame.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use anyhow::Context as _;
 use smithay::backend::renderer::element::{Element as _, Kind, RenderElement};
@@ -41,8 +46,38 @@ struct Inner {
     offscreen: OffscreenBuffer,
     /// Blurring program and its intermediate textures, if available.
     blur: Option<Blur>,
+    /// The renderer context in which the blur program could not be created.
+    blur_unavailable: Option<ContextId<GlesTexture>>,
     /// The last blurred texture and what it was blurred from.
     cached: Option<Cached>,
+    /// Failures already logged for this snapshot.
+    logged: FailureLog,
+}
+
+/// Remembers which failures were logged, so each distinct one is logged once.
+#[derive(Debug, Default)]
+struct FailureLog {
+    seen: HashSet<String>,
+}
+
+impl FailureLog {
+    /// Whether `message` is new; records it.
+    fn first_time(&mut self, message: &str) -> bool {
+        self.seen.insert(message.to_owned())
+    }
+
+    /// Warns about `message` unless it was already logged.
+    fn warn(&mut self, message: String) {
+        if self.first_time(&message) {
+            warn!("{message}");
+        }
+    }
+}
+
+/// Whether to try creating the blur program in `current`, given the context in which it was
+/// last found unavailable.
+fn should_try_blur<C: PartialEq>(unavailable_in: Option<&C>, current: &C) -> bool {
+    unavailable_in != Some(current)
 }
 
 #[derive(Debug)]
@@ -80,7 +115,8 @@ impl SuspendedSnapshot {
     ///
     /// `elements` are positioned relative to the window; the returned element is placed at
     /// `location` plus their offset. Falls back to the unblurred offscreen when the blur program
-    /// is missing or fails.
+    /// is missing or fails. `None` when the offscreen render fails. Each distinct failure is
+    /// logged once until [`SuspendedSnapshot::clear`].
     pub fn render(
         &self,
         renderer: &mut GlesRenderer,
@@ -89,28 +125,41 @@ impl SuspendedSnapshot {
         elements: &[impl RenderElement<GlesRenderer>],
         location: Point<f64, Logical>,
         alpha: f32,
-    ) -> anyhow::Result<(SuspendedRenderElement, OffscreenData)> {
+    ) -> Option<(SuspendedRenderElement, OffscreenData)> {
         let _span = tracy_client::span!("SuspendedSnapshot::render");
 
         let mut inner = self.inner.borrow_mut();
         let inner = inner.get_or_insert_with(Inner::default);
 
-        let (elem, _sync, mut data) = inner
+        let (elem, _sync, mut data) = match inner
             .offscreen
             .render(renderer, scale, elements)
-            .context("error rendering window to offscreen")?;
+            .context("error rendering window to offscreen")
+        {
+            Ok(rendered) => rendered,
+            Err(err) => {
+                inner
+                    .logged
+                    .warn(format!("error rendering suspended window: {err:?}"));
+                return None;
+            }
+        };
         let location = location + elem.offset();
 
-        let blurred = inner
-            .blurred(renderer, &elem, scale, options)
-            .map_err(|err| warn!("error blurring suspended window: {err:?}"))
-            .ok()
-            .flatten();
+        let blurred = match inner.blurred(renderer, &elem, scale, options) {
+            Ok(blurred) => blurred,
+            Err(err) => {
+                inner
+                    .logged
+                    .warn(format!("error blurring suspended window: {err:?}"));
+                None
+            }
+        };
 
         let Some(buffer) = blurred else {
             let elem = elem.with_offset(location).with_alpha(alpha);
             data.id = elem.id().clone();
-            return Ok((elem.into(), data));
+            return Some((elem.into(), data));
         };
 
         let size = elem.logical_size();
@@ -124,14 +173,15 @@ impl SuspendedSnapshot {
         );
         let elem = PrimaryGpuTextureRenderElement(elem);
         data.id = elem.id().clone();
-        Ok((elem.into(), data))
+        Some((elem.into(), data))
     }
 }
 
 impl Inner {
     /// Returns the blurred offscreen, blurring it again only if it went stale.
     ///
-    /// `None` when there is no blur program.
+    /// `None` when there is no blur program; its absence is remembered until the renderer
+    /// context changes.
     fn blurred(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -167,9 +217,14 @@ impl Inner {
             self.blur = None;
         }
         if self.blur.is_none() {
+            if !should_try_blur(self.blur_unavailable.as_ref(), &context_id) {
+                return Ok(None);
+            }
             let Some(blur) = Blur::new(renderer) else {
+                self.blur_unavailable = Some(context_id);
                 return Ok(None);
             };
+            self.blur_unavailable = None;
             self.blur = Some(blur);
         }
         let blur = self.blur.as_mut().unwrap();
@@ -212,6 +267,25 @@ mod tests {
                 offset: 3.,
             },
         }
+    }
+
+    #[test]
+    fn blur_program_is_retried_only_in_a_new_context() {
+        assert!(should_try_blur(None, &1));
+        assert!(!should_try_blur(Some(&1), &1));
+        assert!(should_try_blur(Some(&1), &2));
+    }
+
+    #[test]
+    fn each_distinct_failure_is_logged_once() {
+        let mut log = FailureLog::default();
+        assert!(log.first_time("error rendering blur"));
+        assert!(!log.first_time("error rendering blur"));
+        assert!(log.first_time("error preparing blur textures"));
+        assert!(!log.first_time("error rendering blur"));
+        // A new snapshot starts with a new log.
+        let mut log = FailureLog::default();
+        assert!(log.first_time("error rendering blur"));
     }
 
     #[test]
