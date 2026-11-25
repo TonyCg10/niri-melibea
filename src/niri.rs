@@ -331,6 +331,11 @@ pub struct Niri {
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
+    /// Toplevel surface of the layout window that holds keyboard focus, for `Mapped::is_focused`.
+    ///
+    /// Usually the surface in `keyboard_focus`, but a suspended window keeps this while
+    /// `keyboard_focus` is `Layout { surface: None }`, so that it still counts as focused.
+    pub focused_window: Option<WlSurface>,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
     pub is_fdo_idle_inhibited: Arc<AtomicBool>,
@@ -1174,14 +1179,11 @@ impl State {
                     .map(|surface| KeyboardFocus::LayerShell { surface })
             };
 
+            // A suspended window keeps the layout focus but its surface gets no keys.
             let layout_focus = || {
-                self.niri
-                    .layout
-                    .focus()
-                    .map(|win| win.toplevel().wl_surface().clone())
-                    .map(|surface| KeyboardFocus::Layout {
-                        surface: Some(surface),
-                    })
+                self.niri.layout.focus().map(|win| KeyboardFocus::Layout {
+                    surface: (!win.is_suspended()).then(|| win.toplevel().wl_surface().clone()),
+                })
             };
 
             let excl_focus_on_layer = |layer| {
@@ -1258,27 +1260,29 @@ impl State {
             KeyboardFocus::Layout { surface: None }
         };
 
-        let keyboard = self.niri.seat.get_keyboard().unwrap();
-        if self.niri.keyboard_focus != focus {
-            trace!(
-                "keyboard focus changed from {:?} to {:?}",
-                self.niri.keyboard_focus,
-                focus
-            );
-
-            // Tell the windows their new focus state for window rule purposes.
-            if let KeyboardFocus::Layout {
+        // The layout window that holds keyboard focus: the focused surface's window, or the
+        // layout's focused window when it is suspended and so focused without a surface.
+        let focused_window = match &focus {
+            KeyboardFocus::Layout {
                 surface: Some(surface),
-            } = &self.niri.keyboard_focus
-            {
+            } => Some(surface.clone()),
+            KeyboardFocus::Layout { surface: None } => self
+                .niri
+                .layout
+                .focus()
+                .filter(|win| win.is_suspended())
+                .map(|win| win.toplevel().wl_surface().clone()),
+            _ => None,
+        };
+
+        if self.niri.focused_window != focused_window {
+            // Tell the windows their new focus state for window rule purposes.
+            if let Some(surface) = &self.niri.focused_window {
                 if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
                     mapped.set_is_focused(false);
                 }
             }
-            if let KeyboardFocus::Layout {
-                surface: Some(surface),
-            } = &focus
-            {
+            if let Some(surface) = &focused_window {
                 if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
                     mapped.set_is_focused(true);
 
@@ -1317,6 +1321,17 @@ impl State {
                     }
                 }
             }
+
+            self.niri.focused_window = focused_window;
+        }
+
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        if self.niri.keyboard_focus != focus {
+            trace!(
+                "keyboard focus changed from {:?} to {:?}",
+                self.niri.keyboard_focus,
+                focus
+            );
 
             if let Some(grab) = self.niri.popup_grab.as_mut() {
                 if grab.has_keyboard_grab && Some(&grab.root) != focus.surface() {
@@ -2608,6 +2623,7 @@ impl Niri {
 
             seat,
             keyboard_focus: KeyboardFocus::Layout { surface: None },
+            focused_window: None,
             layer_shell_on_demand_focus: None,
             idle_inhibiting_surfaces: HashSet::new(),
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
@@ -3418,7 +3434,11 @@ impl Niri {
 
         let mapped_hit_data = |(mapped, hit): (&Mapped, HitType)| {
             let window = &mapped.window;
-            let surface_and_pos = if let HitType::Input { win_pos } = hit {
+            // A suspended window is still hit as a window, so clicks focus its tile, but none of
+            // its surfaces gets input: a frozen client would queue it and replay it on thaw.
+            let surface_and_pos = if mapped.is_suspended() {
+                None
+            } else if let HitType::Input { win_pos } = hit {
                 let win_pos_within_output = win_pos;
                 window
                     .surface_under(

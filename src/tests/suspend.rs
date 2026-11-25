@@ -5,10 +5,13 @@
 
 use niri_config::Config;
 use niri_ipc::{Action, WindowActionResult, WindowActionStatus};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as ServerSurface;
+use smithay::utils::{Logical, Point};
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::*;
+use crate::window::Mapped;
 
 fn fixture() -> Fixture {
     let mut f = Fixture::with_config(Config::default());
@@ -115,4 +118,122 @@ fn ipc_reports_the_suspended_flag() {
     f.niri_state().ipc_refresh_layout();
     assert!(f.ipc_window(id).is_none());
     assert!(f.ipc_minimized_window(id).unwrap().is_suspended);
+}
+
+/// The window niri knows as `id`.
+fn mapped(f: &mut Fixture, id: u64) -> &Mapped {
+    f.niri()
+        .layout
+        .windows()
+        .map(|(_, mapped)| mapped)
+        .find(|mapped| mapped.id().get() == id)
+        .expect("the window is in the layout")
+}
+
+/// The server-side toplevel surface of the window niri knows as `id`.
+fn server_surface(f: &mut Fixture, id: u64) -> ServerSurface {
+    mapped(f, id).toplevel().wl_surface().clone()
+}
+
+/// The centre of the area where the pointer hits the window niri knows as `id`, found by probing
+/// the output on an 8 px grid.
+fn window_centre(f: &mut Fixture, id: u64) -> Point<f64, Logical> {
+    let surface = server_surface(f, id);
+    let mut hits = (0..1080)
+        .step_by(8)
+        .flat_map(|y| (0..1920).step_by(8).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let pos = Point::from((f64::from(x), f64::from(y)));
+            f.niri()
+                .contents_under(pos)
+                .window
+                .is_some_and(|(window, _)| window.toplevel().unwrap().wl_surface() == &surface)
+        })
+        .peekable();
+    let first = *hits.peek().expect("the window is somewhere on the output");
+    let (min, max) = hits.fold((first, first), |(min, max), (x, y)| {
+        ((min.0.min(x), min.1.min(y)), (max.0.max(x), max.1.max(y)))
+    });
+    Point::from((f64::from(min.0 + max.0) / 2., f64::from(min.1 + max.1) / 2.))
+}
+
+fn is_focused(f: &mut Fixture, id: u64) -> bool {
+    mapped(f, id).is_focused()
+}
+
+fn focus_window(f: &mut Fixture, id: u64) {
+    f.niri_state().run_ipc_action(Action::FocusWindow { id });
+    f.niri_state().update_keyboard_focus();
+}
+
+#[test]
+fn a_suspended_window_gets_no_keyboard_focus_but_stays_focused_in_ipc() {
+    let mut f = fixture();
+    let client = f.add_client();
+    map_window(&mut f, client);
+    let id = only_window_id(&mut f);
+    let surface = server_surface(&mut f, id);
+    f.niri_state().update_keyboard_focus();
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(&surface));
+
+    set_suspended(&mut f, id, true);
+    assert_eq!(f.niri().keyboard_focus.surface(), None);
+    assert!(is_focused(&mut f, id), "IPC must keep naming the window");
+
+    set_suspended(&mut f, id, false);
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(&surface));
+    assert!(is_focused(&mut f, id));
+}
+
+#[test]
+fn pointer_over_a_suspended_window_finds_no_surface() {
+    let mut f = fixture();
+    let client = f.add_client();
+    map_window(&mut f, client);
+    let id = only_window_id(&mut f);
+
+    let centre = window_centre(&mut f, id);
+
+    let contents = f.niri().contents_under(centre);
+    assert!(
+        contents.surface.is_some(),
+        "an awake window yields its surface"
+    );
+
+    set_suspended(&mut f, id, true);
+    let contents = f.niri().contents_under(centre);
+    assert!(contents.surface.is_none());
+    let (window, _) = contents.window.expect("the tile is still hit");
+    assert_eq!(
+        window.toplevel().unwrap().wl_surface(),
+        &server_surface(&mut f, id)
+    );
+}
+
+#[test]
+fn focus_leaves_and_returns_to_a_suspended_window() {
+    let mut f = fixture();
+    let client = f.add_client();
+    map_window(&mut f, client);
+    let suspended = only_window_id(&mut f);
+    set_suspended(&mut f, suspended, true);
+
+    map_window(&mut f, client);
+    let other = f
+        .niri()
+        .layout
+        .windows()
+        .map(|(_, mapped)| mapped.id().get())
+        .find(|&id| id != suspended)
+        .unwrap();
+    focus_window(&mut f, other);
+    let other_surface = server_surface(&mut f, other);
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(&other_surface));
+    assert!(!is_focused(&mut f, suspended));
+    assert!(is_focused(&mut f, other));
+
+    focus_window(&mut f, suspended);
+    assert!(is_focused(&mut f, suspended));
+    assert!(!is_focused(&mut f, other));
+    assert_eq!(f.niri().keyboard_focus.surface(), None);
 }
