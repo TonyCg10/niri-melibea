@@ -79,6 +79,27 @@ semantic payload directly. For example:
 {"requested_id":42,"window_id":42,"status":"Applied"}
 ```
 
+## Suspended windows
+
+A window can be suspended without leaving the layout, for a daemon that freezes
+a game or another client it keeps on screen:
+
+```sh
+niri msg action set-window-suspended --id WINDOW_ID --suspended true
+niri msg action set-window-suspended --id WINDOW_ID --suspended false
+```
+
+The flag is reported as `is_suspended` in window records. A suspended window
+keeps its place, size and layout focus, but its surfaces get no pointer or
+keyboard input. It is drawn as its last frame, popups included, blurred with
+the `suspend` block's `blur-passes` and `blur-offset` and covered by a black
+dim of opacity `dim` that keeps the geometry corner radius. The client's own
+surfaces are never drawn directly, so the window cannot be scanned out. The
+blurred texture is cached and blurred again only when the window's offscreen
+damage, size, scale or the options change, so a frozen client costs one cached
+texture per frame. Without the blur shader the unblurred frame is drawn under
+the dim. niri never freezes the client itself; that is the caller's choice.
+
 ## Nested evidence
 
 On 2026-08-15, a nested winit niri opened Kitty id 2. After minimize,

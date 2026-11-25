@@ -62,6 +62,12 @@ blur {
     noise 0.02
     saturation 1.5
 }
+
+suspend {
+    blur-passes 3
+    blur-offset 3.0
+    dim 0.35
+}
 ```
 
 ### `spawn-at-startup`
@@ -405,5 +411,25 @@ Values above `1` increase saturation; values below `1` reduce it.
 ```kdl
 blur {
     saturation 1.5
+}
+```
+
+### `suspend`
+
+How a suspended window is drawn.
+A window is suspended over IPC with `niri msg action set-window-suspended --id ID --suspended true`, usually by a daemon that also freezes the client.
+A suspended window gets no input and keeps showing its last frame, blurred and dimmed, like a paused game on a console.
+
+The blurred frame is kept and blurred again only when the window's contents, size, the output scale or these options change, so a frozen client costs one cached texture per frame.
+
+`blur-passes` (1 to 31) and `blur-offset` work like `passes` and `offset` in [`blur`](#passes-and-offset), but apply only to suspended windows and are independent of the `blur` `off` flag.
+`dim` is the opacity of the black layer drawn over the blurred frame, from `0` to `1`; it follows the window's geometry corner radius.
+
+```kdl
+// These are the default values:
+suspend {
+    blur-passes 3
+    blur-offset 3.0
+    dim 0.35
 }
 ```

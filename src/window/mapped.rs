@@ -1012,6 +1012,10 @@ impl LayoutElement for Mapped {
         self.is_urgent
     }
 
+    fn is_suspended(&self) -> bool {
+        self.is_suspended
+    }
+
     fn set_activated(&mut self, active: bool) {
         let changed = self.toplevel().with_pending_state(|state| {
             if active {

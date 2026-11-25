@@ -248,6 +248,11 @@ pub trait LayoutElement {
 
     fn is_urgent(&self) -> bool;
 
+    /// Whether the window is suspended, and drawn as its last frame, blurred and dimmed.
+    fn is_suspended(&self) -> bool {
+        false
+    }
+
     fn configure_intent(&self) -> ConfigureIntent;
     fn send_pending_configure(&mut self);
 
@@ -401,6 +406,7 @@ pub struct Options {
     pub gestures: niri_config::Gestures,
     pub overview: niri_config::Overview,
     pub blur: niri_config::Blur,
+    pub suspend: niri_config::Suspend,
     // Debug flags.
     pub disable_resize_throttling: bool,
     pub disable_transactions: bool,
@@ -707,6 +713,7 @@ impl Options {
             gestures: config.gestures,
             overview: config.overview,
             blur: config.blur,
+            suspend: config.suspend,
             disable_resize_throttling: config.debug.disable_resize_throttling,
             disable_transactions: config.debug.disable_transactions,
             deactivate_unfocused_windows: config.debug.deactivate_unfocused_windows,

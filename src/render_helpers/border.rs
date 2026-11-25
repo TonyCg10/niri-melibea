@@ -223,6 +223,12 @@ impl BorderRenderElement {
         self
     }
 
+    /// Multiplies the element by `alpha` on top of the alpha it was updated with.
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.inner = self.inner.with_alpha(self.params.alpha * alpha);
+        self
+    }
+
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
         Shaders::get(renderer)
             .program(ProgramType::Border)

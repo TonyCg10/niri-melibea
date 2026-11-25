@@ -5,7 +5,7 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
 use smithay::backend::renderer::element::{Element, Kind};
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
@@ -19,6 +19,7 @@ use crate::animation::{Animation, Clock};
 use crate::layout::SizingMode;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
@@ -29,6 +30,7 @@ use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::suspended::{SuspendedRenderElement, SuspendedSnapshot};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -120,6 +122,13 @@ pub struct Tile<W: LayoutElement> {
     /// Extra damage for clipped surface corner radius changes.
     rounded_corner_damage: RoundedCornerDamage,
 
+    /// The blurred last frame drawn while the window is suspended.
+    suspended_snapshot: SuspendedSnapshot,
+
+    /// The dim over a suspended window, square and with the window's corner radius.
+    suspended_dim: SolidColorBuffer,
+    suspended_dim_rounded: BorderRenderElement,
+
     /// The view size for the tile's workspace.
     ///
     /// Used as the fullscreen target size.
@@ -148,6 +157,7 @@ niri_render_elements! {
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
+        Suspended = SuspendedRenderElement,
     }
 }
 
@@ -299,6 +309,9 @@ impl<W: LayoutElement> Tile<W> {
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
+            suspended_snapshot: SuspendedSnapshot::default(),
+            suspended_dim: SolidColorBuffer::default(),
+            suspended_dim_rounded: BorderRenderElement::empty(),
             view_size,
             scale,
             clock,
@@ -682,6 +695,32 @@ impl<W: LayoutElement> Tile<W> {
         );
 
         self.fullscreen_backdrop.resize(animated_tile_size);
+
+        if self.window.is_suspended() {
+            let size = self.animated_window_size();
+            let radius = self
+                .window
+                .geometry_corner_radius()
+                .scaled_by(1. - expanded_progress as f32)
+                .fit_to(size.w as f32, size.h as f32);
+            let color = [0., 0., 0., self.options.suspend.dim as f32];
+            self.suspended_dim.update(size, color);
+            self.suspended_dim_rounded.update(
+                size,
+                Rectangle::from_size(size),
+                GradientInterpolation::default(),
+                Color::from_array_unpremul(color),
+                Color::from_array_unpremul(color),
+                0.,
+                Rectangle::from_size(size),
+                0.,
+                radius,
+                self.scale as f32,
+                1.,
+            );
+        } else {
+            self.suspended_snapshot.clear();
+        }
     }
 
     pub fn scale(&self) -> f64 {
@@ -1214,6 +1253,83 @@ impl<W: LayoutElement> Tile<W> {
         Point::from((0., y))
     }
 
+    /// Draws the suspended window: its last frame blurred, under a dim.
+    #[allow(clippy::too_many_arguments)]
+    fn render_suspended<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        window_render_loc: Point<f64, Logical>,
+        window_size: Size<f64, Logical>,
+        radius: CornerRadius,
+        clip_to_geometry: bool,
+        has_border_shader: bool,
+        win_alpha: f32,
+        xray_pos: XrayPos,
+        push: &mut dyn FnMut(TileInnerRenderElement<R>),
+    ) {
+        let scale = Scale::from(self.scale);
+        let suspend = self.options.suspend;
+
+        // The dim goes on top.
+        if radius != CornerRadius::default() && has_border_shader {
+            let elem = self
+                .suspended_dim_rounded
+                .clone()
+                .with_location(window_render_loc);
+            // The dim's own alpha is the configured one; the window's alpha fades it along.
+            push(elem.with_alpha(win_alpha).into());
+        } else {
+            let elem = SolidColorRenderElement::from_buffer(
+                &self.suspended_dim,
+                window_render_loc,
+                win_alpha,
+                Kind::Unspecified,
+            );
+            push(elem.into());
+        }
+
+        let mut ctx = ctx.as_gles();
+
+        // Render the window at the origin; the snapshot puts it back at window_render_loc.
+        let clip = WindowClip {
+            clip_to_geometry,
+            shader: ClippedSurfaceRenderElement::shader(ctx.renderer).cloned(),
+            has_border_shader,
+            scale,
+            geo: Rectangle::from_size(window_size),
+            radius: radius.fit_to(window_size.w as f32, window_size.h as f32),
+        };
+        let origin = Point::from((0., 0.));
+        let mut elements: Vec<TileInnerRenderElement<GlesRenderer>> = Vec::new();
+        self.window
+            .render_popups(ctx.r(), origin, scale, 1., xray_pos, &mut |elem| {
+                elements.push(elem.into())
+            });
+        self.window
+            .render_normal(ctx.r(), origin, scale, 1., &mut |elem| {
+                elements.push(clip.apply(elem))
+            });
+
+        let options = BlurOptions {
+            passes: suspend.blur_passes,
+            offset: suspend.blur_offset,
+        };
+        match self.suspended_snapshot.render(
+            ctx.renderer,
+            scale,
+            options,
+            &elements,
+            window_render_loc,
+            win_alpha,
+        ) {
+            Ok((elem, data)) => {
+                self.window.set_offscreen_data(Some(data));
+                push(elem.into());
+            }
+            Err(err) => warn!("error rendering suspended window: {err:?}"),
+        }
+    }
+
     fn render_inner<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -1269,19 +1385,38 @@ impl<W: LayoutElement> Tile<W> {
             .geometry_corner_radius()
             .scaled_by(1. - expanded_progress as f32);
 
-        // Popups go on top, whether it's resize or not.
-        self.window.render_popups(
-            ctx.r(),
-            window_render_loc,
-            scale,
-            win_alpha,
-            xray_pos,
-            &mut |elem| push(elem.into()),
-        );
+        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
+
+        // A suspended window is drawn as its last frame, blurred and dimmed, popups included. Its
+        // surface elements are never pushed, so it cannot be scanned out directly.
+        let suspended = self.window.is_suspended();
+        if suspended {
+            self.render_suspended(
+                ctx.r(),
+                window_render_loc,
+                window_size,
+                radius,
+                clip_to_geometry,
+                has_border_shader,
+                win_alpha,
+                xray_pos,
+                push,
+            );
+        } else {
+            // Popups go on top, whether it's resize or not.
+            self.window.render_popups(
+                ctx.r(),
+                window_render_loc,
+                scale,
+                win_alpha,
+                xray_pos,
+                &mut |elem| push(elem.into()),
+            );
+        }
 
         // If we're resizing, try to render a shader, or a fallback.
         let mut pushed_resize = false;
-        if let Some(resize) = &self.resize_animation {
+        if let Some(resize) = self.resize_animation.as_ref().filter(|_| !suspended) {
             if ResizeRenderElement::has_shader(ctx.renderer) {
                 let mut ctx = ctx.as_gles();
 
@@ -1359,68 +1494,19 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         // If we're not resizing, render the window itself.
-        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
-        if !pushed_resize {
+        if !pushed_resize && !suspended {
             let geo = Rectangle::new(window_render_loc, window_size);
             let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
 
-            let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
-            let clip = |elem| match elem {
-                LayoutElementRenderElement::Wayland(elem) => {
-                    // If we should clip to geometry, render a clipped window.
-                    if clip_to_geometry {
-                        if let Some(shader) = clip_shader.clone() {
-                            if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
-                                return ClippedSurfaceRenderElement::new(
-                                    elem,
-                                    scale,
-                                    geo,
-                                    shader.clone(),
-                                    radius,
-                                )
-                                .into();
-                            }
-                        }
-                    }
-
-                    // Otherwise, render it normally.
-                    LayoutElementRenderElement::Wayland(elem).into()
-                }
-                LayoutElementRenderElement::SolidColor(elem) => {
-                    // In this branch we're rendering a blocked-out window with a solid
-                    // color. We need to render it with a rounded corner shader even if
-                    // clip_to_geometry is false, because in this case we're assuming that
-                    // the unclipped window CSD already has corners rounded to the
-                    // user-provided radius, so our blocked-out rendering should match that
-                    // radius.
-                    if radius != CornerRadius::default() && has_border_shader {
-                        return BorderRenderElement::new(
-                            geo.size,
-                            Rectangle::from_size(geo.size),
-                            GradientInterpolation::default(),
-                            Color::from_color32f(elem.color()),
-                            Color::from_color32f(elem.color()),
-                            0.,
-                            Rectangle::from_size(geo.size),
-                            0.,
-                            radius,
-                            scale.x as f32,
-                            1.,
-                        )
-                        .with_location(geo.loc)
-                        .into();
-                    }
-
-                    // Otherwise, render the solid color as is.
-                    LayoutElementRenderElement::SolidColor(elem).into()
-                }
-                elem @ LayoutElementRenderElement::BackgroundEffect(_) => {
-                    // This is only used on popups for now. If subsurface blur is implemented, this
-                    // will need to be handled somehow.
-                    error!("background effect clipping is unimplemented");
-                    elem.into()
-                }
+            let clip = WindowClip {
+                clip_to_geometry,
+                shader: ClippedSurfaceRenderElement::shader(ctx.renderer).cloned(),
+                has_border_shader,
+                scale,
+                geo,
+                radius,
             };
+            let clip_shader = clip.shader.as_ref();
 
             if clip_to_geometry && clip_shader.is_some() {
                 let damage = self.rounded_corner_damage.render(geo);
@@ -1429,7 +1515,7 @@ impl<W: LayoutElement> Tile<W> {
 
             self.window
                 .render_normal(ctx.r(), window_render_loc, scale, win_alpha, &mut |elem| {
-                    push(clip(elem))
+                    push(clip.apply(elem))
                 });
         }
 
@@ -1793,6 +1879,85 @@ impl<W: LayoutElement> Tile<W> {
         let rounded = size.to_physical_precise_round(scale).to_logical(scale);
         assert_abs_diff_eq!(size.w, rounded.w, epsilon = 1e-5);
         assert_abs_diff_eq!(size.h, rounded.h, epsilon = 1e-5);
+    }
+}
+
+/// How a window's own render elements are clipped to its geometry.
+struct WindowClip {
+    clip_to_geometry: bool,
+    shader: Option<GlesTexProgram>,
+    has_border_shader: bool,
+    scale: Scale<f64>,
+    geo: Rectangle<f64, Logical>,
+    radius: CornerRadius,
+}
+
+impl WindowClip {
+    fn apply<R: NiriRenderer>(
+        &self,
+        elem: LayoutElementRenderElement<R>,
+    ) -> TileInnerRenderElement<R> {
+        let Self {
+            clip_to_geometry,
+            ref shader,
+            has_border_shader,
+            scale,
+            geo,
+            radius,
+        } = *self;
+
+        match elem {
+            LayoutElementRenderElement::Wayland(elem) => {
+                // If we should clip to geometry, render a clipped window.
+                if clip_to_geometry {
+                    if let Some(shader) = shader.clone() {
+                        if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
+                            return ClippedSurfaceRenderElement::new(
+                                elem, scale, geo, shader, radius,
+                            )
+                            .into();
+                        }
+                    }
+                }
+
+                // Otherwise, render it normally.
+                LayoutElementRenderElement::Wayland(elem).into()
+            }
+            LayoutElementRenderElement::SolidColor(elem) => {
+                // In this branch we're rendering a blocked-out window with a solid
+                // color. We need to render it with a rounded corner shader even if
+                // clip_to_geometry is false, because in this case we're assuming that
+                // the unclipped window CSD already has corners rounded to the
+                // user-provided radius, so our blocked-out rendering should match that
+                // radius.
+                if radius != CornerRadius::default() && has_border_shader {
+                    return BorderRenderElement::new(
+                        geo.size,
+                        Rectangle::from_size(geo.size),
+                        GradientInterpolation::default(),
+                        Color::from_color32f(elem.color()),
+                        Color::from_color32f(elem.color()),
+                        0.,
+                        Rectangle::from_size(geo.size),
+                        0.,
+                        radius,
+                        scale.x as f32,
+                        1.,
+                    )
+                    .with_location(geo.loc)
+                    .into();
+                }
+
+                // Otherwise, render the solid color as is.
+                LayoutElementRenderElement::SolidColor(elem).into()
+            }
+            elem @ LayoutElementRenderElement::BackgroundEffect(_) => {
+                // This is only used on popups for now. If subsurface blur is implemented, this
+                // will need to be handled somehow.
+                error!("background effect clipping is unimplemented");
+                elem.into()
+            }
+        }
     }
 }
 

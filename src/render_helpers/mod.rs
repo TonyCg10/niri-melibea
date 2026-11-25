@@ -49,6 +49,7 @@ pub mod shadow;
 pub mod snapshot;
 pub mod solid_color;
 pub mod surface;
+pub mod suspended;
 pub mod texture;
 pub mod xray;
 
