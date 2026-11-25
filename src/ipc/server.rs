@@ -136,6 +136,26 @@ impl IpcServer {
     }
 }
 
+#[cfg(test)]
+impl IpcServer {
+    /// The window record an IPC client would currently see.
+    pub fn window_record(&self, id: u64) -> Option<niri_ipc::Window> {
+        let state = self.event_stream_state.borrow();
+        state.windows.windows.get(&id).cloned()
+    }
+
+    /// The minimized-window record an IPC client would currently see.
+    pub fn minimized_record(&self, id: u64) -> Option<niri_ipc::MinimizedWindow> {
+        let state = self.event_stream_state.borrow();
+        state
+            .minimized_windows
+            .windows
+            .iter()
+            .find(|window| window.id == id)
+            .cloned()
+    }
+}
+
 impl Drop for IpcServer {
     fn drop(&mut self) {
         if let Some(socket_path) = &self.socket_path {
@@ -387,15 +407,8 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 
             let (tx, rx) = async_channel::bounded(1);
 
-            let ipc_action = action;
-            let action = niri_config::Action::from(ipc_action.clone());
             ctx.event_loop.insert_idle(move |state| {
-                // Make sure some logic like workspace clean-up has a chance to run before doing
-                // actions.
-                state.niri.advance_animations();
-                let probe = WindowActionProbe::capture(state, &ipc_action);
-                state.do_action(action, false);
-                let result = probe.map(|probe| probe.finish(state));
+                let result = state.run_ipc_action(action);
                 let _ = tx.send_blocking(result);
             });
 
@@ -469,6 +482,19 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
     Ok(response)
 }
 
+impl State {
+    /// Runs an action received over IPC and resolves its semantic window result, if it has one.
+    pub fn run_ipc_action(&mut self, ipc_action: Action) -> Option<WindowActionResult> {
+        let action = niri_config::Action::from(ipc_action.clone());
+        // Make sure some logic like workspace clean-up has a chance to run before doing
+        // actions.
+        self.niri.advance_animations();
+        let probe = WindowActionProbe::capture(self, &ipc_action);
+        self.do_action(action, false);
+        probe.map(|probe| probe.finish(self))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ProbedWindowState {
     Pending(u64),
@@ -488,6 +514,10 @@ enum WindowActionProbe {
         state: ProbedWindowState,
     },
     Close {
+        requested_id: u64,
+        state: ProbedWindowState,
+    },
+    Suspend {
         requested_id: u64,
         state: ProbedWindowState,
     },
@@ -523,6 +553,19 @@ impl WindowActionProbe {
                     ProbedWindowState::Missing
                 };
                 Some(Self::Restore {
+                    requested_id: *id,
+                    state,
+                })
+            }
+            Action::SetWindowSuspended { id, suspended } => {
+                let state = match find_mapped_by_id(state, *id) {
+                    Some(mapped) if mapped.is_suspended() == *suspended => {
+                        ProbedWindowState::Already(*id)
+                    }
+                    Some(_) => ProbedWindowState::Pending(*id),
+                    None => ProbedWindowState::Missing,
+                };
+                Some(Self::Suspend {
                     requested_id: *id,
                     state,
                 })
@@ -606,6 +649,27 @@ impl WindowActionProbe {
                 window_id: None,
                 status: WindowActionStatus::WindowNotFound,
             },
+            Self::Suspend {
+                requested_id,
+                state: ProbedWindowState::Pending(id),
+            } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: Some(id),
+                status: WindowActionStatus::Applied,
+            },
+            Self::Suspend {
+                requested_id,
+                state: ProbedWindowState::Already(id),
+            } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: Some(id),
+                status: WindowActionStatus::AlreadyInRequestedState,
+            },
+            Self::Suspend { requested_id, .. } => WindowActionResult {
+                requested_id: Some(requested_id),
+                window_id: None,
+                status: WindowActionStatus::WindowNotFound,
+            },
             Self::Close {
                 requested_id,
                 state: ProbedWindowState::Pending(id),
@@ -629,6 +693,16 @@ impl WindowActionProbe {
             },
         }
     }
+}
+
+/// A mapped window by id, visible or minimized (including transient descendants).
+fn find_mapped_by_id(state: &State, id: u64) -> Option<&Mapped> {
+    let layout = &state.niri.layout;
+    layout
+        .windows()
+        .map(|(_, mapped)| mapped)
+        .chain(layout.minimized_windows_with_descendants())
+        .find(|mapped| mapped.id().get() == id)
 }
 
 fn visible_window_exists(state: &State, id: u64) -> bool {
@@ -715,6 +789,7 @@ fn make_ipc_window(
         is_focused: mapped.is_focused(),
         is_floating: mapped.is_floating(),
         is_urgent: mapped.is_urgent(),
+        is_suspended: mapped.is_suspended(),
         layout,
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
     })
@@ -727,6 +802,7 @@ fn make_ipc_minimized_window(mapped: &Mapped) -> niri_ipc::MinimizedWindow {
         app_id: role.app_id.clone(),
         pid: mapped.credentials().map(|c| c.pid),
         is_urgent: mapped.is_urgent(),
+        is_suspended: mapped.is_suspended(),
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
     })
 }
@@ -919,8 +995,9 @@ impl State {
             };
 
             let workspace_id = ws_id.map(|id| id.get());
-            let mut changed =
-                ipc_win.workspace_id != workspace_id || ipc_win.is_floating != mapped.is_floating();
+            let mut changed = ipc_win.workspace_id != workspace_id
+                || ipc_win.is_floating != mapped.is_floating()
+                || ipc_win.is_suspended != mapped.is_suspended();
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id

@@ -83,6 +83,7 @@ pub struct Config {
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
+    pub suspend: Suspend,
     pub binding_mode_indicator: BindingModeIndicator,
     pub magnifier: Magnifier,
     pub environment: Environment,
@@ -205,6 +206,7 @@ where
                 "blur" => m_merge!(blur),
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
+                "suspend" => m_merge!(suspend),
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
@@ -668,6 +670,47 @@ mod tests {
         let config = Config::parse_mem("").unwrap();
         assert_eq!(config.input.keyboard.repeat_delay, 600);
         assert_eq!(config.input.keyboard.repeat_rate, 25);
+    }
+
+    #[test]
+    fn suspend_block_parses() {
+        let config =
+            Config::parse_mem("suspend {\n    blur-passes 5\n    blur-offset 2.5\n    dim 0.5\n}")
+                .unwrap();
+        assert_eq!(
+            config.suspend,
+            Suspend {
+                blur_passes: 5,
+                blur_offset: 2.5,
+                dim: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn an_absent_suspend_block_gives_the_defaults() {
+        let config = Config::parse_mem("").unwrap();
+        assert_eq!(
+            config.suspend,
+            Suspend {
+                blur_passes: 3,
+                blur_offset: 3.0,
+                dim: 0.35,
+            }
+        );
+    }
+
+    #[test]
+    fn out_of_range_suspend_values_are_errors() {
+        for text in [
+            "suspend { dim 1.5; }",
+            "suspend { dim -0.1; }",
+            "suspend { blur-passes 0; }",
+            "suspend { blur-passes 32; }",
+            "suspend { blur-offset -1; }",
+        ] {
+            assert!(Config::parse_mem(text).is_err(), "accepted: {text}");
+        }
     }
 
     #[track_caller]
@@ -1729,6 +1772,11 @@ mod tests {
                         a: 0.3137255,
                     },
                 },
+            },
+            suspend: Suspend {
+                blur_passes: 3,
+                blur_offset: 3.0,
+                dim: 0.35,
             },
             binding_mode_indicator: BindingModeIndicator {
                 off: false,

@@ -1,3 +1,5 @@
+use knuffel::errors::DecodeError;
+
 use crate::animations::{BindingModeIndicatorAnim, MagnifierAnim};
 use crate::appearance::{Color, WorkspaceShadow, WorkspaceShadowPart, DEFAULT_BACKDROP_COLOR};
 use crate::utils::{Flag, MergeWith};
@@ -253,6 +255,91 @@ impl MergeWith<OverviewPart> for Overview {
     fn merge_with(&mut self, part: &OverviewPart) {
         merge!((self, part), zoom, workspace_shadow);
         merge_clone!((self, part), backdrop_color);
+    }
+}
+
+/// How a suspended window is drawn: blurred and dimmed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Suspend {
+    pub blur_passes: u8,
+    pub blur_offset: f64,
+    pub dim: f64,
+}
+
+impl Default for Suspend {
+    fn default() -> Self {
+        Self {
+            blur_passes: 3,
+            blur_offset: 3.0,
+            dim: 0.35,
+        }
+    }
+}
+
+/// Number of blur passes of a suspended window, 1 to 31.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuspendBlurPasses(pub u8);
+
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct SuspendPart {
+    #[knuffel(child, unwrap(argument))]
+    pub blur_passes: Option<SuspendBlurPasses>,
+    #[knuffel(child, unwrap(argument))]
+    pub blur_offset: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub dim: Option<FloatOrInt<0, 1>>,
+}
+
+impl MergeWith<SuspendPart> for Suspend {
+    fn merge_with(&mut self, part: &SuspendPart) {
+        if let Some(passes) = part.blur_passes {
+            self.blur_passes = passes.0;
+        }
+        merge!((self, part), blur_offset, dim);
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for SuspendBlurPasses {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        match &**val {
+            knuffel::ast::Literal::Int(value) => match i32::try_from(value) {
+                Ok(v) if (1..=31).contains(&v) => Ok(Self(v as u8)),
+                Ok(_) => {
+                    ctx.emit_error(DecodeError::conversion(
+                        val,
+                        "value must be between 1 and 31",
+                    ));
+                    Ok(Self(Suspend::default().blur_passes))
+                }
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    Ok(Self(Suspend::default().blur_passes))
+                }
+            },
+            _ => {
+                ctx.emit_error(DecodeError::unsupported(
+                    val,
+                    "Unsupported value, only integers are recognized",
+                ));
+                Ok(Self(Suspend::default().blur_passes))
+            }
+        }
     }
 }
 

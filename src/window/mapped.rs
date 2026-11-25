@@ -88,6 +88,12 @@ pub struct Mapped {
     /// Whether this has an urgent indicator.
     is_urgent: bool,
 
+    /// Whether this window is suspended.
+    ///
+    /// Set over IPC by the daemon that decides to suspend. The flag itself changes nothing here;
+    /// input and rendering read it.
+    is_suspended: bool,
+
     /// Whether this window has the keyboard focus.
     is_focused: bool,
 
@@ -297,6 +303,7 @@ impl Mapped {
             needs_frame_callback: false,
             offscreen_data: RefCell::new(None),
             is_urgent: false,
+            is_suspended: false,
             is_focused: false,
             is_active_in_column: true,
             is_floating: false,
@@ -626,6 +633,17 @@ impl Mapped {
 
     pub fn is_urgent(&self) -> bool {
         self.is_urgent
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.is_suspended
+    }
+
+    /// Sets the suspended flag, returning whether it changed.
+    pub fn set_suspended(&mut self, suspended: bool) -> bool {
+        let changed = self.is_suspended != suspended;
+        self.is_suspended = suspended;
+        changed
     }
 }
 

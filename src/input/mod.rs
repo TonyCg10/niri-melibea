@@ -152,6 +152,37 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Sets the suspended flag of a visible or minimized window.
+    ///
+    /// Task-neutral on purpose: what suspension does to focus and the pointer is decided by
+    /// `update_keyboard_focus` and `refresh_pointer_contents`, which are re-run after a change.
+    fn act_set_window_suspended(&mut self, id: u64, suspended: bool) {
+        let surface = self
+            .niri
+            .layout
+            .windows()
+            .map(|(_, mapped)| mapped)
+            .chain(self.niri.layout.minimized_windows_with_descendants())
+            .find(|mapped| mapped.id().get() == id)
+            .map(|mapped| mapped.toplevel().wl_surface().clone());
+        let Some(surface) = surface else {
+            return;
+        };
+
+        let changed = self
+            .niri
+            .layout
+            .find_window_and_output_mut(&surface)
+            .is_some_and(|(mapped, _)| mapped.set_suspended(suspended));
+        if !changed {
+            return;
+        }
+
+        self.niri.queue_redraw_all();
+        self.update_keyboard_focus();
+        self.refresh_pointer_contents();
+    }
+
     /// Restores one minimized window with an optional presentation hint.
     fn act_restore(&mut self, id: u64, transition: Option<&WindowTransition>) {
         let window = self
@@ -1064,6 +1095,9 @@ impl State {
             }
             Action::MinimizeWindow => self.act_minimize(None, None),
             Action::MinimizeWindowById(id) => self.act_minimize(Some(id), None),
+            Action::SetWindowSuspended(id, suspended) => {
+                self.act_set_window_suspended(id, suspended)
+            }
             Action::MinimizeWindowWithTransition(id, transition) => {
                 self.act_minimize(id, Some(&transition));
             }

@@ -218,6 +218,9 @@ pub enum Action {
     MinimizeWindow,
     #[knuffel(skip)]
     MinimizeWindowById(u64),
+    /// Suspend or resume a window. IPC-only: the daemon that decides to suspend owns the choice.
+    #[knuffel(skip)]
+    SetWindowSuspended(u64, bool),
     #[knuffel(skip)]
     RestoreWindow(u64),
     /// Minimize with an action-scoped presentation hint.
@@ -524,6 +527,9 @@ impl From<niri_ipc::Action> for Action {
                 id: Some(id),
                 transition: None,
             } => Self::MinimizeWindowById(id),
+            niri_ipc::Action::SetWindowSuspended { id, suspended } => {
+                Self::SetWindowSuspended(id, suspended)
+            }
             niri_ipc::Action::RestoreWindow {
                 id,
                 transition: Some(transition),

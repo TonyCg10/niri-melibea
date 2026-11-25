@@ -392,6 +392,7 @@ mod tests {
             app_id: Some("org.example.App".to_owned()),
             pid: Some(100),
             is_urgent: false,
+            is_suspended: false,
             focus_timestamp: None,
         }
     }

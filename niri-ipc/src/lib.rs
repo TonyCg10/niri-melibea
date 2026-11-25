@@ -192,7 +192,7 @@ pub struct PickedColor {
 /// Actions that niri can perform.
 // Variants in this enum should match the spelling of the ones in niri-config. Most, but not all,
 // variants from niri-config should be present here.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "clap", derive(clap::Parser))]
 #[cfg_attr(feature = "clap", command(subcommand_value_name = "ACTION"))]
 #[cfg_attr(feature = "clap", command(subcommand_help_heading = "Actions"))]
@@ -315,6 +315,18 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "clap", arg(skip))]
         transition: Option<WindowTransition>,
+    },
+    /// Mark a window as suspended, or lift the mark.
+    ///
+    /// A suspended window keeps its place in the layout but takes no input.
+    #[cfg_attr(feature = "clap", clap(about = "Suspend or resume a window"))]
+    SetWindowSuspended {
+        /// Id of the window to suspend or resume.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: u64,
+        /// Whether the window is suspended.
+        #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set))]
+        suspended: bool,
     },
     /// Experimentally restore a natively minimized window by id.
     RestoreWindow {
@@ -1365,6 +1377,11 @@ pub struct Window {
     pub is_floating: bool,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
+    /// Whether this window is suspended.
+    ///
+    /// Absent in the output of a niri that predates the flag, which reads as `false`.
+    #[serde(default)]
+    pub is_suspended: bool,
     /// Position- and size-related properties of the window.
     pub layout: WindowLayout,
     /// Timestamp when the window was most recently focused.
@@ -1395,6 +1412,9 @@ pub struct MinimizedWindow {
     pub pid: Option<i32>,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
+    /// Whether this window is suspended.
+    #[serde(default)]
+    pub is_suspended: bool,
     /// Timestamp when the window was most recently focused.
     pub focus_timestamp: Option<Timestamp>,
 }
@@ -2213,6 +2233,43 @@ impl OutputAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Window` as a niri that predates the suspended flag sends it.
+    const WINDOW_JSON_WITHOUT_IS_SUSPENDED: &str = r#"{
+        "id": 7,
+        "title": "t",
+        "app_id": "a",
+        "pid": 1,
+        "workspace_id": 1,
+        "is_focused": false,
+        "is_floating": false,
+        "is_urgent": false,
+        "layout": {
+            "pos_in_scrolling_layout": null,
+            "tile_size": [1.0, 1.0],
+            "window_size": [1, 1],
+            "tile_pos_in_workspace_view": null,
+            "window_offset_in_tile": [0.0, 0.0]
+        },
+        "focus_timestamp": null
+    }"#;
+
+    #[test]
+    fn set_window_suspended_round_trips() {
+        let action = Action::SetWindowSuspended {
+            id: 7,
+            suspended: true,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, r#"{"SetWindowSuspended":{"id":7,"suspended":true}}"#);
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), action);
+    }
+
+    #[test]
+    fn a_window_from_an_older_niri_is_not_suspended() {
+        let window: Window = serde_json::from_str(WINDOW_JSON_WITHOUT_IS_SUSPENDED).unwrap();
+        assert!(!window.is_suspended);
+    }
 
     #[test]
     fn legacy_minimization_actions_keep_their_exact_wire_form() {
