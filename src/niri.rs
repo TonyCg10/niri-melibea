@@ -1151,17 +1151,17 @@ impl State {
             }
         }
 
-        // Compute the current focus.
-        let focus = if self.niri.exit_confirm_dialog.is_open() {
-            KeyboardFocus::ExitConfirmDialog
+        // Compute the current focus, and the layout window that holds it: the focused surface's
+        // window, or a suspended window that is focused without a surface.
+        let (focus, focused_window) = if self.niri.exit_confirm_dialog.is_open() {
+            (KeyboardFocus::ExitConfirmDialog, None)
         } else if self.niri.is_locked() {
-            KeyboardFocus::LockScreen {
-                surface: self.niri.lock_surface_focus(),
-            }
+            let surface = self.niri.lock_surface_focus();
+            (KeyboardFocus::LockScreen { surface }, None)
         } else if self.niri.screenshot_ui.is_open() {
-            KeyboardFocus::ScreenshotUi
+            (KeyboardFocus::ScreenshotUi, None)
         } else if self.niri.window_mru_ui.is_open() {
-            KeyboardFocus::Mru
+            (KeyboardFocus::Mru, None)
         } else if let Some(output) = self.niri.layout.active_output() {
             let mon = self.niri.layout.monitor_for_output(output).unwrap();
             let layers = layer_map_for_output(output);
@@ -1255,24 +1255,17 @@ impl State {
                 surface = surface.or_else(|| excl_focus_on_layer(Layer::Background));
             }
 
-            surface.unwrap_or(KeyboardFocus::Layout { surface: None })
+            let focus = surface.unwrap_or(KeyboardFocus::Layout { surface: None });
+            // On this path a `Layout` focus comes from `layout_focus`, or from the fallback when
+            // the layout has no focused window, so the layout's focused window is the holder.
+            let focused_window = focus
+                .is_layout()
+                .then(|| self.niri.layout.focus())
+                .flatten()
+                .map(|win| win.toplevel().wl_surface().clone());
+            (focus, focused_window)
         } else {
-            KeyboardFocus::Layout { surface: None }
-        };
-
-        // The layout window that holds keyboard focus: the focused surface's window, or the
-        // layout's focused window when it is suspended and so focused without a surface.
-        let focused_window = match &focus {
-            KeyboardFocus::Layout {
-                surface: Some(surface),
-            } => Some(surface.clone()),
-            KeyboardFocus::Layout { surface: None } => self
-                .niri
-                .layout
-                .focus()
-                .filter(|win| win.is_suspended())
-                .map(|win| win.toplevel().wl_surface().clone()),
-            _ => None,
+            (KeyboardFocus::Layout { surface: None }, None)
         };
 
         if self.niri.focused_window != focused_window {

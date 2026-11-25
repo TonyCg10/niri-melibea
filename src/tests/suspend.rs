@@ -237,3 +237,23 @@ fn focus_leaves_and_returns_to_a_suspended_window() {
     assert!(!is_focused(&mut f, other));
     assert_eq!(f.niri().keyboard_focus.surface(), None);
 }
+
+#[test]
+fn a_suspended_window_is_not_focused_while_the_overview_is_open() {
+    let mut f = fixture();
+    let client = f.add_client();
+    map_window(&mut f, client);
+    let id = only_window_id(&mut f);
+    set_suspended(&mut f, id, true);
+    assert!(is_focused(&mut f, id));
+
+    f.niri_state().run_ipc_action(Action::OpenOverview {});
+    f.niri_state().update_keyboard_focus();
+    assert!(f.niri().keyboard_focus.is_overview());
+    assert!(!is_focused(&mut f, id));
+
+    f.niri_state().run_ipc_action(Action::CloseOverview {});
+    f.niri_state().update_keyboard_focus();
+    assert_eq!(f.niri().keyboard_focus.surface(), None);
+    assert!(is_focused(&mut f, id));
+}
