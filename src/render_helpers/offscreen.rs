@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use anyhow::Context as _;
 use smithay::backend::allocator::Fourcc;
@@ -31,6 +31,9 @@ pub struct OffscreenBuffer {
     ///
     /// Lazily created when `render` is called. Recreated when necessary.
     inner: RefCell<Option<Inner>>,
+
+    /// Bumped every time the texture is (re)created, when its damage history restarts.
+    generation: Cell<u64>,
 }
 
 #[derive(Debug)]
@@ -58,6 +61,7 @@ pub struct OffscreenRenderElement {
     src_size: Size<i32, Buffer>,
     alpha: f32,
     kind: Kind,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -138,6 +142,7 @@ impl OffscreenBuffer {
             let buffer_size = src_size.to_logical(1, Transform::Normal).to_physical(1);
             let damage = OutputDamageTracker::new(buffer_size, scale, Transform::Normal);
 
+            self.generation.set(self.generation.get().wrapping_add(1));
             inner.insert(Inner {
                 texture,
                 renderer_context_id: renderer.context_id(),
@@ -159,6 +164,7 @@ impl OffscreenBuffer {
             trace!("recreating damage tracker due to scale change");
             inner.damage = OutputDamageTracker::new(buffer_size, scale, Transform::Normal);
             inner.outer_damage = DamageBag::default();
+            self.generation.set(self.generation.get().wrapping_add(1));
         }
 
         let res = {
@@ -190,6 +196,7 @@ impl OffscreenBuffer {
             src_size,
             alpha: 1.,
             kind: Kind::Unspecified,
+            generation: self.generation.get(),
         };
 
         let data = OffscreenData {
@@ -206,6 +213,7 @@ impl Default for OffscreenBuffer {
         OffscreenBuffer {
             inner: RefCell::new(None),
             id: Id::new(),
+            generation: Cell::new(0),
         }
     }
 }
@@ -217,6 +225,12 @@ impl OffscreenRenderElement {
 
     pub fn offset(&self) -> Point<f64, Logical> {
         self.offset
+    }
+
+    /// Generation of the offscreen texture; it changes whenever the texture is recreated and its
+    /// commit counter restarts.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn with_alpha(mut self, alpha: f32) -> Self {

@@ -1,7 +1,8 @@
 //! Drawing of a suspended window: its last frame, blurred.
 //!
 //! A suspended client is frozen and never commits, so the blurred texture is kept and reused
-//! until the window's offscreen damage, its size, the output scale or the blur options change.
+//! until the window's offscreen damage or texture, its size, the output scale or the blur options
+//! change.
 
 use std::cell::RefCell;
 
@@ -54,6 +55,8 @@ struct Cached {
 /// Everything a blurred texture depends on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct BlurKey {
+    /// Generation of the offscreen texture; the commit below restarts when it changes.
+    generation: u64,
     /// Commit of the offscreen element; it moves on with every damage to the offscreen.
     commit: CommitCounter,
     /// Size of the offscreen texture.
@@ -138,6 +141,7 @@ impl Inner {
     ) -> anyhow::Result<Option<TextureBuffer<GlesTexture>>> {
         let source = elem.texture();
         let key = BlurKey {
+            generation: elem.generation(),
             commit: elem.current_commit(),
             size: source.size(),
             scale,
@@ -199,6 +203,7 @@ mod tests {
 
     fn key() -> BlurKey {
         BlurKey {
+            generation: 1,
             commit: CommitCounter::default(),
             size: Size::new(800, 600),
             scale: Scale::from(1.),
@@ -223,6 +228,15 @@ mod tests {
     fn offscreen_damage_reblurs() {
         let mut current = key();
         current.commit.increment();
+        assert!(needs_reblur(Some(&key()), &current));
+    }
+
+    #[test]
+    fn recreated_offscreen_texture_reblurs() {
+        // A recreated texture restarts its commit counter, so equal commit, size, scale and
+        // options can still mean different content.
+        let mut current = key();
+        current.generation += 1;
         assert!(needs_reblur(Some(&key()), &current));
     }
 
